@@ -11,6 +11,7 @@ pub fn generate_report(
     surprising: &[(String, String, f64)],
     orphan_count: usize,
     community_of: &HashMap<String, usize>,
+    link: &dyn Fn(&str) -> String,
 ) -> String {
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
 
@@ -36,8 +37,8 @@ pub fn generate_report(
     report.push_str("|------|------|-------|-------------|-------------|----------|\n");
     for (i, gn) in god_nodes.iter().enumerate() {
         report.push_str(&format!(
-            "| {} | [[{}]] | {:.2} | {} | {:.2} | {:.2} |\n",
-            i + 1, gn.name, gn.score, gn.degree, gn.betweenness, gn.pagerank
+            "| {} | {} | {:.2} | {} | {:.2} | {:.2} |\n",
+            i + 1, link(&gn.name), gn.score, gn.degree, gn.betweenness, gn.pagerank
         ));
     }
     report.push('\n');
@@ -54,12 +55,12 @@ pub fn generate_report(
             .cloned()
             .unwrap_or_default();
         report.push_str(&format!(
-            "### Community {} — [[{}]] ({} notes)\n\n",
-            i + 1, label, members.len()
+            "### Community {} — {} ({} notes)\n\n",
+            i + 1, link(&label), members.len()
         ));
         let display_members: Vec<String> = members.iter()
             .take(15)
-            .map(|m| format!("[[{}]]", m))
+            .map(|m| link(m))
             .collect();
         report.push_str(&format!("{}", display_members.join(", ")));
         if members.len() > 15 {
@@ -76,8 +77,8 @@ pub fn generate_report(
             let s_comm = community_of.get(source).copied().unwrap_or(0);
             let t_comm = community_of.get(target).copied().unwrap_or(0);
             report.push_str(&format!(
-                "- [[{}]] (community {}) → [[{}]] (community {}) — bridge score: {:.2}\n",
-                source, s_comm + 1, target, t_comm + 1, score
+                "- {} (community {}) → {} (community {}) — bridge score: {:.2}\n",
+                link(source), s_comm + 1, link(target), t_comm + 1, score
             ));
         }
         report.push('\n');
@@ -89,23 +90,23 @@ pub fn generate_report(
 
     if god_nodes.len() >= 2 {
         report.push_str(&format!(
-            "1. How does [[{}]] connect to [[{}]]? (top two god nodes)\n",
-            god_nodes[0].name, god_nodes[1].name
+            "1. How does {} connect to {}? (top two god nodes)\n",
+            link(&god_nodes[0].name), link(&god_nodes[1].name)
         ));
     }
     if communities.len() >= 2 {
         let c1_label = communities[0].first().cloned().unwrap_or_default();
         let c2_label = communities[1].first().cloned().unwrap_or_default();
         report.push_str(&format!(
-            "2. What bridges the topics around [[{}]] and [[{}]]?\n",
-            c1_label, c2_label
+            "2. What bridges the topics around {} and {}?\n",
+            link(&c1_label), link(&c2_label)
         ));
     }
     if !surprising.is_empty() {
         let (s, t, _) = &surprising[0];
         report.push_str(&format!(
-            "3. Why are [[{}]] and [[{}]] connected across communities?\n",
-            s, t
+            "3. Why are {} and {} connected across communities?\n",
+            link(s), link(t)
         ));
     }
     if orphan_count > 0 {

@@ -6,6 +6,22 @@ use rmcp::handler::server::router::tool::ToolRouter;
 
 use crate::cache::{id_from_rel, Resolver, VaultCache};
 
+/// Obsidian's "New link format" (Settings → Files & links).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkFormat {
+    Shortest,
+    Relative,
+    Absolute,
+}
+
+/// How links the server writes are spelled, mirroring the vault's own
+/// Obsidian settings (`useMarkdownLinks`, `newLinkFormat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkStyle {
+    Wikilink,
+    Markdown(LinkFormat),
+}
+
 /// Librarian MCP Server — give Claude a librarian for your markdown vault
 #[derive(Clone)]
 pub struct LibraryServer {
@@ -24,6 +40,8 @@ pub struct LibraryServer {
     /// When false, `library_write` / `library_import` never insert links.
     /// (`library_suggest_links` still reports suggestions.)
     pub auto_link: bool,
+    /// Spelling of links the server writes.
+    pub link_style: LinkStyle,
     /// Unified vault cache (search index, graph, titles)
     pub cache: std::sync::Arc<Mutex<VaultCache>>,
     pub tool_router: ToolRouter<Self>,
@@ -74,6 +92,101 @@ impl LibraryServer {
             }
         }
         set.into_iter().collect()
+    }
+
+    /// Link style from the first vault's `.obsidian/app.json`
+    /// (`useMarkdownLinks`, `newLinkFormat`); `LIBRARIAN_LINK_STYLE=wikilink|markdown`
+    /// overrides the wikilink/markdown choice. Defaults match Obsidian's own.
+    pub fn detect_link_style(library_paths: &[PathBuf]) -> LinkStyle {
+        let mut use_markdown = false;
+        let mut format = LinkFormat::Shortest;
+        if let Some(root) = library_paths.first() {
+            if let Ok(text) = std::fs::read_to_string(root.join(".obsidian").join("app.json")) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    use_markdown = v.get("useMarkdownLinks").and_then(|x| x.as_bool()).unwrap_or(false);
+                    format = match v.get("newLinkFormat").and_then(|x| x.as_str()) {
+                        Some("relative") => LinkFormat::Relative,
+                        Some("absolute") => LinkFormat::Absolute,
+                        _ => LinkFormat::Shortest,
+                    };
+                }
+            }
+        }
+        match std::env::var("LIBRARIAN_LINK_STYLE").ok().as_deref() {
+            Some("wikilink") => LinkStyle::Wikilink,
+            Some("markdown") => LinkStyle::Markdown(format),
+            _ if use_markdown => LinkStyle::Markdown(format),
+            _ => LinkStyle::Wikilink,
+        }
+    }
+
+    /// Percent-encode the characters that would break a markdown link target.
+    fn encode_link_path(path: &str) -> String {
+        let mut out = String::with_capacity(path.len());
+        for ch in path.chars() {
+            if " %#?:()[]<>\"".contains(ch) {
+                out.push_str(&format!("%{:02X}", ch as u32));
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Path from `source_id`'s folder to `target_id`, spelled so that the
+    /// resolver maps it back to the target. Same-folder targets always get an
+    /// explicit `./`: a bare `Foo.md` is only safe while no root-level
+    /// `Foo.md` exists, and the point is to never become ambiguous.
+    fn relative_link_path(resolver: &Resolver, source_id: &str, target_id: &str) -> String {
+        let src: Vec<&str> = source_id.split('/').collect();
+        let src_dirs = &src[..src.len() - 1];
+        let tgt: Vec<&str> = target_id.split('/').collect();
+        let tgt_dirs = &tgt[..tgt.len() - 1];
+        let common = src_dirs.iter().zip(tgt_dirs).take_while(|(a, b)| a == b).count();
+        let ups = src_dirs.len() - common;
+        let mut parts: Vec<&str> = vec![".."; ups];
+        parts.extend(&tgt[common..]);
+        let rel = format!("{}.md", parts.join("/"));
+        let vault = format!("{}.md", target_id);
+
+        let mut candidates = vec![if ups == 0 { format!("./{}", rel) } else { rel }];
+        candidates.push(vault.clone());
+        for c in candidates {
+            if resolver.resolve(source_id, &c).as_deref() == Some(target_id) {
+                return Self::encode_link_path(&c);
+            }
+        }
+        Self::encode_link_path(&vault)
+    }
+
+    /// Spell a link from `source_id` to `target_id` in the vault's style.
+    /// `display` is the visible text; None uses the note's name.
+    pub fn format_link(
+        &self,
+        resolver: &Resolver,
+        source_id: &str,
+        target_id: &str,
+        display: Option<&str>,
+    ) -> String {
+        let name = target_id.rsplit('/').next().unwrap_or(target_id);
+        match self.link_style {
+            LinkStyle::Wikilink => {
+                let text = resolver.link_text(target_id);
+                match display {
+                    Some(d) if d != name => format!("[[{}|{}]]", text, d),
+                    _ => format!("[[{}]]", text),
+                }
+            }
+            LinkStyle::Markdown(format) => {
+                let path = match format {
+                    LinkFormat::Relative => Self::relative_link_path(resolver, source_id, target_id),
+                    LinkFormat::Shortest | LinkFormat::Absolute => {
+                        Self::encode_link_path(&format!("{}.md", target_id))
+                    }
+                };
+                format!("[{}]({})", display.unwrap_or(name), path)
+            }
+        }
     }
 
     /// Top-level directory component of a vault-relative path ("" if none).
@@ -218,7 +331,8 @@ impl LibraryServer {
         self.auto_link_content(content, exclude_path, titles)
     }
 
-    /// Auto-link: scan content for mentions of existing note titles and wrap them in [[wikilinks]].
+    /// Auto-link: scan content for mentions of existing note titles and link them
+    /// in the vault's link style (wikilinks by default).
     pub fn auto_link_content(&self, content: &str, exclude_path: &str, titles: &[(String, String, String)]) -> (String, Vec<String>) {
         let existing_links = Self::extract_wikilinks(content);
         let existing_set: HashSet<&str> = existing_links.iter().map(|s| s.as_str()).collect();
@@ -250,7 +364,7 @@ impl LibraryServer {
 
         let mut linked_stems: HashSet<String> = HashSet::new();
 
-        for (match_term, canonical, _rel) in &candidates {
+        for (match_term, canonical, rel) in &candidates {
             if linked_stems.contains(canonical.as_str()) {
                 continue;
             }
@@ -298,11 +412,20 @@ impl LibraryServer {
                 };
 
                 if let Some((m_start, m_end)) = found {
-                    let replacement = if match_term.to_lowercase() == canonical.to_lowercase() {
-                        format!("[[{}]]", canonical)
+                    let matched_text = &body_part[m_start..m_end];
+                    let target_id = id_from_rel(rel);
+                    let display = if match_term.to_lowercase() == canonical.to_lowercase() {
+                        None
                     } else {
-                        let matched_text = &body_part[m_start..m_end];
-                        format!("[[{}|{}]]", canonical, matched_text)
+                        Some(matched_text)
+                    };
+                    let replacement = match self.link_style {
+                        // Wikilinks keep their legacy shape: the canonical name.
+                        LinkStyle::Wikilink => self.format_link(&resolver, &source_id, &target_id, display),
+                        // Markdown links show the text as written in the note.
+                        LinkStyle::Markdown(_) => {
+                            self.format_link(&resolver, &source_id, &target_id, Some(matched_text))
+                        }
                     };
                     let new_body = format!(
                         "{}{}{}",

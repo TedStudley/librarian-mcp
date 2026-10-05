@@ -87,7 +87,10 @@ pub fn generate_index_body(server: &LibraryServer, topic: &str, description: &st
             let id = crate::cache::id_from_rel(rel);
             if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
                 if !stem.is_empty() && stem != topic {
-                    by_dir.entry(dir).or_default().push(cache.resolver.link_text(&id));
+                    by_dir
+                        .entry(dir)
+                        .or_default()
+                        .push(server.format_link(&cache.resolver, &format!("Index/{}", topic), &id, None));
                 }
             }
         }
@@ -119,7 +122,7 @@ pub fn generate_index_body(server: &LibraryServer, topic: &str, description: &st
     for (dir, stems) in &by_dir {
         body.push_str(&format!("\n## {}\n\n", dir));
         for stem in stems {
-            body.push_str(&format!("- [[{}]]\n", stem));
+            body.push_str(&format!("- {}\n", stem));
         }
     }
 

@@ -108,7 +108,7 @@ Librarian exposes 17 tools to Claude:
 |------|-------------|
 | `library_search` | Full-text search across all vault files (trigram-indexed) |
 | `library_read` | Read a file by relative path |
-| `library_write` | Write a file with auto-wikilink detection |
+| `library_write` | Write a file with auto-linking in the vault's link style |
 | `library_list` | List files and directories (shows vault roots when multi-vault) |
 | `library_links` | Get backlinks and outgoing links (wikilinks and markdown links) for a file |
 | `library_tags` | List all #tags with counts, optionally filtered by prefix |
@@ -163,9 +163,17 @@ The vault includes source evaluation (5-tier trust system), contradiction protoc
 
 ### Auto-linking
 
-When Claude writes files via `library_write`, Librarian scans for mentions of existing note titles and wraps them in `[[wikilinks]]`. This happens **only on explicit writes** — Librarian never modifies files you didn't ask it to write.
+When Claude writes files via `library_write`, Librarian scans for mentions of existing note titles and links them. This happens **only on explicit writes** — Librarian never modifies files you didn't ask it to write.
 
-Links use canonical file names so they resolve correctly in Obsidian's graph view, even on case-sensitive filesystems. Frontmatter aliases are supported: if a note has `aliases: [ML, machine learning]`, mentions will auto-link using `[[Note Name|ML]]` format.
+The link style follows the vault's own Obsidian settings, read from `.obsidian/app.json` of the first vault (`LIBRARIAN_LINK_STYLE=wikilink|markdown` overrides the wikilink/markdown choice):
+
+| `useMarkdownLinks` | `newLinkFormat` | Written link |
+|---|---|---|
+| `false` (default) | any | `[[Note]]`, or `[[Note\|ML]]` for an alias; `[[folder/Note]]` if the name is ambiguous |
+| `true` | `relative` | `[Note](../folder/Note.md)`; same-folder links are `[Note](./Note.md)` |
+| `true` | `shortest` / `absolute` | `[Note](folder/Note.md)` (vault-root path) |
+
+Markdown links never rely on a bare file name, so a note added later can't make them ambiguous. Frontmatter aliases are supported.
 
 To turn auto-linking off, run with `--no-autolink` or set `LIBRARIAN_AUTOLINK=off`. `library_suggest_links` still reports suggestions, and it skips notes that are already linked by wikilink or markdown link.
 
@@ -211,10 +219,10 @@ private/
 
 Librarian works seamlessly alongside Obsidian — both can be open at the same time:
 
-- Reads and writes standard `[[wikilinks]]` and `[[note|display text]]`; also reads relative markdown links
+- Reads `[[wikilinks]]`, `[[note|display text]]` and relative markdown links; writes in whichever style the vault is configured for
 - Respects YAML frontmatter and `aliases`
 - Skips `.obsidian/` and `.trash/` directories
-- Auto-linked wikilinks resolve in Obsidian's graph view
+- Auto-linked links resolve in Obsidian's graph view
 - Daily notes follow `Journal/YYYY/YYYY-MM-DD.md` convention
 
 ## License

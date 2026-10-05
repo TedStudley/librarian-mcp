@@ -92,12 +92,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::var("LIBRARIAN_AUTOLINK").ok().as_deref().map(str::to_lowercase).as_deref(),
             Some("off" | "0" | "false" | "no")
         );
+    let link_style = LibraryServer::detect_link_style(&library_paths);
     let server = LibraryServer {
         library_paths,
         default_ignores,
         link_stoplist,
         isolated_folders,
         auto_link,
+        link_style,
         cache: std::sync::Arc::new(Mutex::new(VaultCache::default())),
         tool_router: LibraryServer::new_tool_router(),
     };
@@ -106,7 +108,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vault_cache = VaultCache::build_full(&server);
     *server.cache.lock().unwrap() = vault_cache;
 
-    eprintln!("Librarian: auto-link {}", if server.auto_link { "on" } else { "off" });
+    eprintln!(
+        "Librarian: auto-link {}, link style {:?}",
+        if server.auto_link { "on" } else { "off" },
+        server.link_style
+    );
 
     if vault_display.len() == 1 {
         eprintln!("Librarian MCP starting — vault: {}", vault_display[0]);
