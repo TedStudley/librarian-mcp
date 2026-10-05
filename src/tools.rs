@@ -221,7 +221,7 @@ impl LibraryServer {
         }
     }
 
-    #[tool(description = "Write or create a file in the library. Auto-links mentions of existing notes as [[wikilinks]] using canonical file names for Obsidian graph compatibility. Creates parent directories if needed.")]
+    #[tool(description = "Write or create a file in the library. Auto-links mentions of existing notes as [[wikilinks]] using canonical file names for Obsidian graph compatibility, unless auto-linking is disabled (--no-autolink or LIBRARIAN_AUTOLINK=off). Creates parent directories if needed.")]
     async fn library_write(
         &self,
         params: Parameters<WriteParams>,
@@ -234,7 +234,7 @@ impl LibraryServer {
             let cache = self.cache.lock().unwrap();
             cache.titles.clone()
         };
-        let (linked_content, links_added) = self.auto_link_content(&params.0.content, &params.0.path, &titles);
+        let (linked_content, links_added) = self.maybe_auto_link(&params.0.content, &params.0.path, &titles);
         match std::fs::write(&full, &linked_content) {
             Ok(_) => {
                 if let Ok(mut cache) = self.cache.lock() {
@@ -891,7 +891,7 @@ impl LibraryServer {
             let cache = self.cache.lock().unwrap();
             cache.titles.clone()
         };
-        let (linked_content, links_added) = self.auto_link_content(&content, lib_path, &titles);
+        let (linked_content, links_added) = self.maybe_auto_link(&content, lib_path, &titles);
         let full_path = self.resolve_path(lib_path);
         if let Some(parent) = full_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1406,6 +1406,7 @@ mod tests {
             default_ignores: vec![],
             link_stoplist: vec![],
             isolated_folders: vec![],
+            auto_link: true,
             cache: Arc::new(Mutex::new(VaultCache::default())),
             tool_router: LibraryServer::new_tool_router(),
         };
@@ -1424,6 +1425,7 @@ mod tests {
             default_ignores: vec![],
             link_stoplist: vec!["claude".to_string()],
             isolated_folders: vec![],
+            auto_link: true,
             cache: Arc::new(Mutex::new(VaultCache::default())),
             tool_router: LibraryServer::new_tool_router(),
         };
@@ -1474,6 +1476,7 @@ mod tests {
             default_ignores: vec![],
             link_stoplist: vec![],
             isolated_folders: vec!["Threshold".to_string()],
+            auto_link: true,
             cache: Arc::new(Mutex::new(VaultCache::default())),
             tool_router: LibraryServer::new_tool_router(),
         };
@@ -1491,24 +1494,45 @@ mod tests {
         assert!(added.iter().any(|l| l == "QuantFlow"), "non-isolated link still allowed");
     }
 
-    // Mentions inside an existing markdown link must not be wrapped again.
-    #[test]
-    fn auto_link_skips_text_inside_markdown_links() {
-        let server = LibraryServer {
+    fn test_server(auto_link: bool) -> LibraryServer {
+        LibraryServer {
             library_paths: vec![],
             default_ignores: vec![],
             link_stoplist: vec![],
             isolated_folders: vec![],
+            auto_link,
             cache: Arc::new(Mutex::new(VaultCache::default())),
             tool_router: LibraryServer::new_tool_router(),
-        };
+        }
+    }
+
+    // Mentions inside an existing markdown link must not be wrapped again.
+    #[test]
+    fn auto_link_skips_text_inside_markdown_links() {
+        let s = test_server(true);
         let titles = vec![(
             "QuantFlow".to_string(),
             "QuantFlow".to_string(),
             "Index/QuantFlow.md".to_string(),
         )];
         let inside = "[all about QuantFlow](https://example.com/x)";
-        let (out, added) = server.auto_link_content(inside, "notes/a.md", &titles);
+        let (out, added) = s.auto_link_content(inside, "notes/a.md", &titles);
         assert_eq!((out.as_str(), added.len()), (inside, 0));
     }
+    #[test]
+    fn auto_link_can_be_disabled_for_writes_only() {
+        let s = test_server(false);
+        let titles = vec![(
+            "QuantFlow".to_string(),
+            "QuantFlow".to_string(),
+            "Index/QuantFlow.md".to_string(),
+        )];
+        let text = "See QuantFlow tuning.";
+        let (out, added) = s.maybe_auto_link(text, "notes/a.md", &titles);
+        assert_eq!((out.as_str(), added.len()), (text, 0));
+        // Suggestions still work with auto-linking off.
+        let (_, suggestions) = s.auto_link_content(text, "notes/a.md", &titles);
+        assert_eq!(suggestions, vec!["QuantFlow"]);
+    }
+
 }

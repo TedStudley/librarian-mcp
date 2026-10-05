@@ -33,6 +33,10 @@ struct Cli {
     /// Auto-configure Claude Desktop and Claude Code to use Librarian
     #[arg(long)]
     setup: bool,
+
+    /// Never insert links on write/import (same as LIBRARIAN_AUTOLINK=off)
+    #[arg(long)]
+    no_autolink: bool,
 }
 
 #[tokio::main]
@@ -83,11 +87,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build a temporary server to access all_md_files for cache building
     let link_stoplist = LibraryServer::build_link_stoplist(&library_paths);
     let isolated_folders = LibraryServer::build_isolated_folders(&library_paths);
+    let auto_link = !cli.no_autolink
+        && !matches!(
+            std::env::var("LIBRARIAN_AUTOLINK").ok().as_deref().map(str::to_lowercase).as_deref(),
+            Some("off" | "0" | "false" | "no")
+        );
     let server = LibraryServer {
         library_paths,
         default_ignores,
         link_stoplist,
         isolated_folders,
+        auto_link,
         cache: std::sync::Arc::new(Mutex::new(VaultCache::default())),
         tool_router: LibraryServer::new_tool_router(),
     };
@@ -95,6 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build full vault cache (search index, graph, titles) in one pass
     let vault_cache = VaultCache::build_full(&server);
     *server.cache.lock().unwrap() = vault_cache;
+
+    eprintln!("Librarian: auto-link {}", if server.auto_link { "on" } else { "off" });
 
     if vault_display.len() == 1 {
         eprintln!("Librarian MCP starting — vault: {}", vault_display[0]);

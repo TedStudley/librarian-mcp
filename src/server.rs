@@ -21,6 +21,9 @@ pub struct LibraryServer {
     /// may cross their boundary in either direction (e.g. a fiction book dir).
     /// Loaded from `.librarianisolate` in the vault root.
     pub isolated_folders: Vec<String>,
+    /// When false, `library_write` / `library_import` never insert links.
+    /// (`library_suggest_links` still reports suggestions.)
+    pub auto_link: bool,
     /// Unified vault cache (search index, graph, titles)
     pub cache: std::sync::Arc<Mutex<VaultCache>>,
     pub tool_router: ToolRouter<Self>,
@@ -205,6 +208,14 @@ impl LibraryServer {
         }
 
         zones
+    }
+
+    /// `auto_link_content`, unless auto-linking is switched off.
+    pub fn maybe_auto_link(&self, content: &str, exclude_path: &str, titles: &[(String, String, String)]) -> (String, Vec<String>) {
+        if !self.auto_link {
+            return (content.to_string(), Vec::new());
+        }
+        self.auto_link_content(content, exclude_path, titles)
     }
 
     /// Auto-link: scan content for mentions of existing note titles and wrap them in [[wikilinks]].
