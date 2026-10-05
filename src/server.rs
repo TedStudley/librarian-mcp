@@ -318,6 +318,16 @@ impl LibraryServer {
             .collect()
     }
 
+    /// All link targets in a note.
+    pub fn extract_links(content: &str) -> Vec<String> {
+        Self::extract_wikilinks(content)
+    }
+
+    /// Graph node id for an absolute path inside a vault.
+    pub fn node_id(&self, abs: &Path) -> String {
+        crate::cache::id_from_rel(&self.relative_path(abs))
+    }
+
     pub fn extract_tags(content: &str) -> Vec<String> {
         let re = regex::Regex::new(r"(?:^|\s)#([\w/-]+)").unwrap();
         re.captures_iter(content)

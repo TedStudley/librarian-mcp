@@ -171,6 +171,16 @@ To turn auto-linking off, run with `--no-autolink` or set `LIBRARIAN_AUTOLINK=of
 
 Auto-linking skips code blocks, inline code, URLs, and existing links to avoid corrupting content.
 
+### Link resolution
+
+Notes are graph nodes identified by their vault-relative path (`plans/room-unlocking`), so same-named notes in different folders are distinct. A `[[wikilink]]` resolves the way Obsidian resolves it:
+
+1. an exact path from the vault root;
+2. a path relative to the linking file;
+3. a name or path-suffix match anywhere in the vault: the shortest full path wins, then byte-wise lexicographic order.
+
+Unresolved links appear as `?target` nodes. Tools that take a note (`library_links`, `library_traverse`, `library_shortest_path`) accept a path or a bare name, and `library_stats` lists `duplicate_names`.
+
 ### Knowledge graph traversal
 
 Librarian builds a bidirectional graph from your vault's `[[wikilinks]]` and exposes three graph tools:

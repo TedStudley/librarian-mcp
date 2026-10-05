@@ -6,7 +6,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use crate::server::LibraryServer;
 use crate::graph;
@@ -114,7 +113,7 @@ pub struct ImportParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraverseParams {
-    /// Note title (file stem) to start traversal from
+    /// Note to start traversal from: a vault path (plans/x) or a bare note name
     pub start: String,
     /// Maximum number of hops (default 2)
     pub depth: Option<usize>,
@@ -128,9 +127,9 @@ pub struct TraverseParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ShortestPathParams {
-    /// Starting note title (file stem)
+    /// Starting note: a vault path (plans/x) or a bare note name
     pub from: String,
-    /// Target note title (file stem)
+    /// Target note: a vault path (plans/x) or a bare note name
     pub to: String,
 }
 
@@ -144,6 +143,19 @@ pub struct VisualizeParams {
 pub struct ReportParams {
     /// Output file path within the vault (defaults to GRAPH_REPORT.md in vault root)
     pub output_path: Option<String>,
+}
+
+/// When a bare name matched several notes, say which one was used and what
+/// else it could have meant, instead of silently answering for one of them.
+fn note_ambiguity(result: &mut serde_json::Value, field: &str, used: &str, others: &[String]) {
+    if others.is_empty() {
+        return;
+    }
+    result["ambiguous"][field] = serde_json::json!({
+        "used": used,
+        "also_matches": others.iter().filter(|o| o.as_str() != used).collect::<Vec<_>>(),
+        "hint": "pass a full path such as the ones above to choose a specific note",
+    });
 }
 
 // A stem is orphan iff it has zero outgoing AND zero incoming edges in the
@@ -373,24 +385,24 @@ impl LibraryServer {
         &self,
         params: Parameters<LinksParams>,
     ) -> Result<CallToolResult, McpError> {
-        let target_name = Path::new(&params.0.path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
         let mut cache = self.cache.lock().unwrap();
         cache.check_and_refresh(self);
+        let target_name = cache
+            .resolve_input(&params.0.path)
+            .unwrap_or_else(|| crate::cache::id_from_rel(&params.0.path));
         let outgoing_links = cache.outgoing.get(&target_name).cloned().unwrap_or_default();
         let backlinks: Vec<String> = cache.incoming.get(&target_name).cloned().unwrap_or_default();
+        let ambiguous = cache.input_ambiguity(&params.0.path);
         drop(cache);
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "file": params.0.path,
             "backlinks": backlinks,
             "outgoing": outgoing_links,
             "backlink_count": backlinks.len(),
             "outgoing_count": outgoing_links.len(),
         });
+        note_ambiguity(&mut result, "path", &target_name, &ambiguous);
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -485,13 +497,11 @@ impl LibraryServer {
     async fn library_stats(&self) -> Result<CallToolResult, McpError> {
         let files = self.all_md_files();
         let mut total_words = 0usize;
-        let mut total_links = 0usize;
         let mut tag_count = HashSet::new();
 
         for path in &files {
             if let Ok(content) = std::fs::read_to_string(path) {
                 total_words += content.split_whitespace().count();
-                total_links += Self::extract_wikilinks(&content).len();
                 for tag in Self::extract_tags(&content) { tag_count.insert(tag); }
             }
         }
@@ -501,17 +511,15 @@ impl LibraryServer {
         // incoming-only check flagged any file that nothing linked TO as orphan
         // — even if it had outgoing wikilinks — which contradicted the graph
         // tool and surprised callers right after `library_write` auto-linked.
-        let (outgoing, incoming) = {
+        let (outgoing, incoming, duplicate_names) = {
             let mut cache = self.cache.lock().unwrap();
             cache.check_and_refresh(self);
-            (cache.outgoing.clone(), cache.incoming.clone())
+            (cache.outgoing.clone(), cache.incoming.clone(), cache.resolver.duplicate_names())
         };
+        let total_links: usize = outgoing.values().map(|v| v.len()).sum();
 
         let orphans: Vec<_> = files.iter()
-            .filter(|p| {
-                let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                is_orphan_stem(&stem, &outgoing, &incoming)
-            })
+            .filter(|p| is_orphan_stem(&self.node_id(p), &outgoing, &incoming))
             .map(|p| self.relative_path(p))
             .collect();
 
@@ -523,6 +531,10 @@ impl LibraryServer {
             "unique_tags": tag_count.len(),
             "orphan_count": orphans.len(),
             "orphans_sample": &orphans[..orphans.len().min(10)],
+            // Bare references to these names are ambiguous; tools never guess.
+            "duplicate_names": duplicate_names.iter().take(20)
+                .map(|(name, ids)| serde_json::json!({ "name": name, "notes": ids }))
+                .collect::<Vec<_>>(),
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -571,9 +583,13 @@ impl LibraryServer {
         params: Parameters<TraverseParams>,
     ) -> Result<CallToolResult, McpError> {
         let max_depth = params.0.depth.unwrap_or(2);
-        let start = &params.0.start;
         let mut cache_guard = self.cache.lock().unwrap();
         cache_guard.check_and_refresh(self);
+        let start_id = cache_guard
+            .resolve_input(&params.0.start)
+            .unwrap_or_else(|| params.0.start.clone());
+        let start = &start_id;
+        let start_ambiguous = cache_guard.input_ambiguity(&params.0.start);
         let outgoing = cache_guard.outgoing.clone();
         let incoming = cache_guard.incoming.clone();
         drop(cache_guard);
@@ -611,8 +627,7 @@ impl LibraryServer {
             .filter(|(node, _)| match &params.0.tag_filter {
                 None => true,
                 Some(tag_filter) => self.all_md_files().iter().any(|p| {
-                    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    if &stem != *node { return false; }
+                    if &self.node_id(p) != *node { return false; }
                     if let Ok(content) = std::fs::read_to_string(p) {
                         Self::extract_tags(&content).iter().any(|t| t == tag_filter)
                     } else { false }
@@ -627,9 +642,7 @@ impl LibraryServer {
             Some(q) => {
                 let cache = self.cache.lock().unwrap();
                 cache.search_index.search(q, 300).iter()
-                    .filter_map(|(p, _, s)| {
-                        p.file_stem().map(|st| (st.to_string_lossy().to_string(), *s))
-                    })
+                    .map(|(p, _, s)| (self.node_id(p), *s))
                     .collect()
             }
             None => HashMap::new(),
@@ -664,7 +677,7 @@ impl LibraryServer {
         unique_edges.sort();
         unique_edges.dedup();
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "start": start,
             "max_depth": max_depth,
             "nodes_found": nodes.len(),
@@ -673,6 +686,7 @@ impl LibraryServer {
                 .map(|(a, b)| serde_json::json!({ "from": a, "to": b }))
                 .collect::<Vec<_>>(),
         });
+        note_ambiguity(&mut result, "start", start, &start_ambiguous);
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -684,10 +698,14 @@ impl LibraryServer {
         &self,
         params: Parameters<ShortestPathParams>,
     ) -> Result<CallToolResult, McpError> {
-        let from = &params.0.from;
-        let to = &params.0.to;
         let mut cache_guard = self.cache.lock().unwrap();
         cache_guard.check_and_refresh(self);
+        let from_id = cache_guard.resolve_input(&params.0.from).unwrap_or_else(|| params.0.from.clone());
+        let to_id = cache_guard.resolve_input(&params.0.to).unwrap_or_else(|| params.0.to.clone());
+        let from = &from_id;
+        let to = &to_id;
+        let from_ambiguous = cache_guard.input_ambiguity(&params.0.from);
+        let to_ambiguous = cache_guard.input_ambiguity(&params.0.to);
         let outgoing = cache_guard.outgoing.clone();
         let incoming = cache_guard.incoming.clone();
         drop(cache_guard);
@@ -722,13 +740,16 @@ impl LibraryServer {
         }
 
         if !found {
+            let mut result = serde_json::json!({
+                "from": from,
+                "to": to,
+                "path": null,
+                "message": "No path found between these notes"
+            });
+            note_ambiguity(&mut result, "from", from, &from_ambiguous);
+            note_ambiguity(&mut result, "to", to, &to_ambiguous);
             return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "from": from,
-                    "to": to,
-                    "path": null,
-                    "message": "No path found between these notes"
-                })).unwrap_or_default(),
+                serde_json::to_string_pretty(&result).unwrap_or_default(),
             )]));
         }
 
@@ -740,12 +761,14 @@ impl LibraryServer {
         }
         path.reverse();
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "from": from,
             "to": to,
             "hops": path.len() - 1,
             "path": path,
         });
+        note_ambiguity(&mut result, "from", from, &from_ambiguous);
+        note_ambiguity(&mut result, "to", to, &to_ambiguous);
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -1135,13 +1158,17 @@ impl LibraryServer {
             match std::fs::write(&note_path, &body) {
                 Ok(_) => {
                     if let Ok(mut cache) = self.cache.lock() {
-                        cache.update_single_file(&note_path, &body, self);
+                        cache.update_file_deferred(&note_path, &body, self);
                     }
                     total_links += related;
                     lines.push(format!("  {} — {} notes / {} dirs", topic, related, dirs));
                 }
                 Err(e) => lines.push(format!("  {} — FAILED: {}", topic, e)),
             }
+        }
+
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.refresh_graph();
         }
 
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1248,14 +1275,15 @@ impl LibraryServer {
             let date = chrono::Local::now().format("%Y-%m-%d").to_string();
             let backup = root.join(format!(".optimize-bak-{}", date));
 
-            // stem -> relative path for resolving densify targets.
-            let stem_to_rel: HashMap<String, String> = {
+            // node id -> relative path for resolving densify targets, plus a
+            // resolver snapshot for naming link targets.
+            let (stem_to_rel, resolver): (HashMap<String, String>, crate::cache::Resolver) = {
                 let c = self.cache.lock().unwrap();
                 let mut m = HashMap::new();
-                for (_t, canonical, rel) in &c.titles {
-                    m.entry(canonical.clone()).or_insert_with(|| rel.clone());
+                for (_t, _canonical, rel) in &c.titles {
+                    m.entry(crate::cache::id_from_rel(rel)).or_insert_with(|| rel.clone());
                 }
-                m
+                (m, c.resolver.clone())
             };
 
             // Hubs: write a MOC linking exactly the planned community members.
@@ -1283,7 +1311,7 @@ impl LibraryServer {
                 );
                 for (dir, stems) in &by_dir {
                     body.push_str(&format!("\n## {}\n\n", dir));
-                    let mut s = stems.clone();
+                    let mut s: Vec<String> = stems.iter().map(|id| resolver.link_text(id)).collect();
                     s.sort();
                     for st in s {
                         body.push_str(&format!("- [[{}]]\n", st));
@@ -1292,7 +1320,7 @@ impl LibraryServer {
                 let _ = std::fs::create_dir_all(note_path.parent().unwrap());
                 if std::fs::write(&note_path, &body).is_ok() {
                     if let Ok(mut c) = self.cache.lock() {
-                        c.update_single_file(&note_path, &body, self);
+                        c.update_file_deferred(&note_path, &body, self);
                     }
                 }
             }
@@ -1305,12 +1333,19 @@ impl LibraryServer {
                 let bak = backup.join(rel);
                 if let Some(p) = bak.parent() { let _ = std::fs::create_dir_all(p); }
                 let _ = std::fs::write(&bak, &content);
-                let updated = Self::upsert_related_block(&content, peers);
+                let peer_text: Vec<String> = peers
+                    .iter()
+                    .map(|p| resolver.link_text(p))
+                    .collect();
+                let updated = Self::upsert_related_block(&content, &peer_text);
                 if std::fs::write(&path, &updated).is_ok() {
                     if let Ok(mut c) = self.cache.lock() {
-                        c.update_single_file(&path, &updated, self);
+                        c.update_file_deferred(&path, &updated, self);
                     }
                 }
+            }
+            if let Ok(mut c) = self.cache.lock() {
+                c.refresh_graph();
             }
             applied_note = format!(
                 "\nAPPLIED. Backed up touched notes to .optimize-bak-{}/\n",
@@ -1494,6 +1529,70 @@ mod tests {
         assert!(added.iter().any(|l| l == "QuantFlow"), "non-isolated link still allowed");
     }
 
+    fn resolver(ids: &[&str]) -> crate::cache::Resolver {
+        crate::cache::Resolver::new(ids.iter().map(|s| s.to_string()))
+    }
+
+    // Order measured against Obsidian: vault-root path, then path relative to
+    // the linking file, then name/suffix lookup.
+    #[test]
+    fn resolver_precedence_matches_obsidian() {
+        // Root path beats a relative hit.
+        let r = resolver(&["Foo", "b/Foo", "b/src"]);
+        assert_eq!(r.resolve("b/src", "Foo.md").as_deref(), Some("Foo"));
+        // Without the root file, the relative hit wins over a shorter name match.
+        let r = resolver(&["b/Foo", "b/sub/Foo", "b/sub/src", "a/Foo"]);
+        assert_eq!(r.resolve("b/sub/src", "Foo.md").as_deref(), Some("b/sub/Foo"));
+        // Vault-root folder path beats relative folder path.
+        let r = resolver(&["a/Foo", "b/a/Foo", "b/src"]);
+        assert_eq!(r.resolve("b/src", "a/Foo.md").as_deref(), Some("a/Foo"));
+        // `..` is resolved relative to the source.
+        let r = resolver(&["a/Foo", "b/src"]);
+        assert_eq!(r.resolve("b/src", "../a/Foo.md").as_deref(), Some("a/Foo"));
+        // Escaping the vault never resolves.
+        assert_eq!(r.resolve("b/src", "../../x.md"), None);
+    }
+
+    // Name lookup: shortest full path wins, then byte-wise lexicographic order.
+    #[test]
+    fn resolver_name_lookup_tie_break() {
+        let r = resolver(&["len/a/x/Len", "len/mmmmmmmmmmmmmmmm/Len", "len/z/Len", "src"]);
+        assert_eq!(r.resolve("src", "Len").as_deref(), Some("len/z/Len"));
+        let r = resolver(&["tie/zz/Tie", "tie/b/Tie", "tie/c/Tie", "src"]);
+        assert_eq!(r.resolve("src", "Tie").as_deref(), Some("tie/b/Tie"));
+        // Byte order: uppercase sorts before lowercase.
+        let r = resolver(&["case/a/Zed", "case/B/Zed", "src"]);
+        assert_eq!(r.resolve("src", "Zed").as_deref(), Some("case/B/Zed"));
+        // Path-qualified names match as a path suffix.
+        let r = resolver(&["b/Foo", "b/sub/Foo", "src"]);
+        assert_eq!(r.resolve("src", "sub/Foo").as_deref(), Some("b/sub/Foo"));
+    }
+
+    #[test]
+    fn resolver_strips_anchors_and_reports_unresolved() {
+        let r = resolver(&["notes/Foo", "src"]);
+        assert_eq!(r.resolve("src", "Foo#Heading").as_deref(), Some("notes/Foo"));
+        assert_eq!(r.resolve("src", "Foo^block").as_deref(), Some("notes/Foo"));
+        assert_eq!(r.resolve("src", "Missing"), None);
+        assert_eq!(r.resolve("src", "#only-heading"), None);
+    }
+
+    #[test]
+    fn link_text_qualifies_only_when_name_is_ambiguous() {
+        let r = resolver(&["Unique", "a/Dup", "b/sub/Dup"]);
+        // Unique name: bare. Ambiguous name: full vault path for every
+        // candidate, including the one that would win the name lookup.
+        assert_eq!(r.link_text("Unique"), "Unique");
+        assert_eq!(r.link_text("a/Dup"), "a/Dup");
+        assert_eq!(r.link_text("b/sub/Dup"), "b/sub/Dup");
+    }
+
+    #[test]
+    fn wikilinks_are_still_extracted_verbatim() {
+        let got = LibraryServer::extract_links("[[Foo]] and [[bar|alias]]");
+        assert_eq!(got, vec!["Foo", "bar"]);
+    }
+
     fn test_server(auto_link: bool) -> LibraryServer {
         LibraryServer {
             library_paths: vec![],
@@ -1535,4 +1634,154 @@ mod tests {
         assert_eq!(suggestions, vec!["QuantFlow"]);
     }
 
+    #[test]
+    fn resolver_edge_cases() {
+        let r = resolver(&["a/Foo", "b/Foo", "c/sub/Foo", "Top"]);
+        assert_eq!(r.resolve("x/src", "/Top").as_deref(), Some("Top"));
+        assert_eq!(r.resolve("x/src", "/a/Foo").as_deref(), Some("a/Foo"));
+        assert_eq!(r.resolve("x/src", "/Nope"), None);
+        assert_eq!(r.resolve("x/src", ""), None);
+        assert_eq!(r.resolve("x/src", "Foo.MD").as_deref(), Some("a/Foo"));
+        assert!(r.escapes_vault("Top", "../x.md"));
+        assert!(!r.escapes_vault("a/Foo", "../Top.md"));
+        assert_eq!(r.ambiguous_matches("Foo"), vec!["a/Foo", "b/Foo", "c/sub/Foo"]);
+        assert!(r.ambiguous_matches("a/Foo").is_empty());
+        assert!(r.ambiguous_matches("sub/Foo").is_empty());
+        assert_eq!(
+            r.duplicate_names(),
+            vec![("Foo".to_string(), vec!["a/Foo".to_string(), "b/Foo".to_string(), "c/sub/Foo".to_string()])],
+        );
+    }
+
+    #[test]
+    fn ambiguity_note_names_the_note_that_was_used() {
+        let mut v = serde_json::json!({ "a": 1 });
+        note_ambiguity(&mut v, "path", "a/Foo", &["a/Foo".to_string(), "b/Foo".to_string()]);
+        assert_eq!(v["ambiguous"]["path"]["used"], "a/Foo");
+        assert_eq!(v["ambiguous"]["path"]["also_matches"], serde_json::json!(["b/Foo"]));
+        // Two ambiguous inputs (shortest_path's from/to) must both be reported.
+        note_ambiguity(&mut v, "to", "c/Bar", &["c/Bar".to_string(), "d/Bar".to_string()]);
+        assert_eq!(v["ambiguous"]["to"]["used"], "c/Bar");
+        assert_eq!(v["ambiguous"]["path"]["used"], "a/Foo");
+        let mut w = serde_json::json!({});
+        note_ambiguity(&mut w, "path", "x", &[]);
+        assert!(w.get("ambiguous").is_none());
+    }
+
+    // Deleted, renamed and edited files must all show up in the graph.
+    #[test]
+    fn refresh_follows_delete_rename_and_edit() {
+        let dir = temp_vault("refresh-all", &[
+            ("a.md", "[[b]] [[sub/c]]"),
+            ("b.md", "x"),
+            ("sub/c.md", "y"),
+        ]);
+        let server = server_for(dir.clone());
+        let mut cache = VaultCache::build_full(&server);
+        assert_eq!(cache.incoming["b"], vec!["a"]);
+
+        std::fs::remove_file(dir.join("b.md")).unwrap();
+        cache.check_and_refresh(&server);
+        assert_eq!(cache.outgoing["a"], vec!["?b", "sub/c"]);
+        assert!(!cache.outgoing.contains_key("b"));
+
+        std::fs::rename(dir.join("sub/c.md"), dir.join("sub/d.md")).unwrap();
+        cache.check_and_refresh(&server);
+        assert_eq!(cache.outgoing["a"], vec!["?b", "?sub/c"]);
+        assert!(cache.outgoing.contains_key("sub/d") && !cache.outgoing.contains_key("sub/c"));
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(dir.join("a.md"), "[[sub/d]]").unwrap();
+        cache.check_and_refresh(&server);
+        assert_eq!(cache.outgoing["a"], vec!["sub/d"]);
+        assert_eq!(cache.incoming["sub/d"], vec!["a"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Generated index notes qualify same-named notes and keep bare names for
+    // unique ones.
+    #[test]
+    fn index_notes_qualify_same_named_notes() {
+        let dir = temp_vault("index-style", &[
+            ("Index/Topic.md", "# Topic"),
+            ("a/Dup.md", "Topic material"),
+            ("b/Dup.md", "Topic material"),
+            ("c/Uniq.md", "Topic material"),
+        ]);
+        let server = server_for(dir.clone());
+        *server.cache.lock().unwrap() = VaultCache::build_full(&server);
+
+        let body = crate::index::generate_index_body(&server, "Topic", "").0;
+        assert!(body.contains("[[a/Dup]]") && body.contains("[[b/Dup]]") && body.contains("[[Uniq]]"), "{}", body);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    fn temp_vault(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("librarian-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (rel, body) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        dir
+    }
+
+    fn server_for(dir: std::path::PathBuf) -> LibraryServer {
+        LibraryServer {
+            library_paths: vec![dir],
+            default_ignores: vec![],
+            link_stoplist: vec![],
+            isolated_folders: vec![],
+            auto_link: true,
+            cache: Arc::new(Mutex::new(VaultCache::default())),
+            tool_router: LibraryServer::new_tool_router(),
+        }
+    }
+
+    // Wikilinks become path-keyed edges; same-named notes in different folders
+    // stay distinct nodes; unresolved links are kept apart from real notes.
+    #[test]
+    fn wikilinks_build_path_keyed_graph() {
+        let dir = temp_vault("wikigraph", &[
+            ("INDEX.md", "[[architecture]] [[patterns/orm#rows]] [[plans/dup]] [[missing]]"),
+            ("architecture.md", "no links"),
+            ("patterns/orm.md", "[[../architecture]] [[dup]]"),
+            ("patterns/dup.md", "x"),
+            ("plans/dup.md", "y"),
+        ]);
+        let server = server_for(dir.clone());
+        let cache = VaultCache::build_full(&server);
+
+        let mut index_out = cache.outgoing["INDEX"].clone();
+        index_out.sort();
+        assert_eq!(index_out, vec!["?missing", "architecture", "patterns/orm", "plans/dup"]);
+        let mut orm_out = cache.outgoing["patterns/orm"].clone();
+        orm_out.sort();
+        assert_eq!(orm_out, vec!["architecture", "patterns/dup"]);
+        assert_eq!(cache.incoming["plans/dup"], vec!["INDEX"]);
+        assert_eq!(cache.incoming["patterns/dup"], vec!["patterns/orm"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Adding a file can change how an existing bare reference resolves, so the
+    // graph must be re-derived on refresh, not patched per file.
+    #[test]
+    fn refresh_reresolves_existing_links() {
+        let dir = temp_vault("reresolve", &[
+            ("src.md", "[[Foo]]"),
+            ("deep/er/Foo.md", "x"),
+        ]);
+        let server = server_for(dir.clone());
+        let mut cache = VaultCache::build_full(&server);
+        assert_eq!(cache.outgoing["src"], vec!["deep/er/Foo"]);
+
+        std::fs::write(dir.join("Foo.md"), "root").unwrap();
+        cache.check_and_refresh(&server);
+        assert_eq!(cache.outgoing["src"], vec!["Foo"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
