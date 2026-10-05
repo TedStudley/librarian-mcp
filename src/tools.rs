@@ -272,8 +272,14 @@ impl LibraryServer {
                         let mut suggestions: Vec<(String, String)> = Vec::new();
 
                         if let Ok(cache) = self.cache.lock() {
+                            // Notes that already link here, in any link style.
+                            let already: HashSet<&String> = cache
+                                .incoming
+                                .get(&self.node_id(&full))
+                                .map(|v| v.iter().collect())
+                                .unwrap_or_default();
                             for (path, content) in &cache.search_index.files {
-                                if path == &full {
+                                if path == &full || already.contains(&self.node_id(path)) {
                                     continue;
                                 }
                                 let content_lower = content.to_lowercase();
@@ -542,7 +548,7 @@ impl LibraryServer {
         )]))
     }
 
-    #[tool(description = "Suggest wikilinks for a file. Scans content for mentions of existing note titles (including aliases) that aren't already linked. Returns suggestions without modifying the file.")]
+    #[tool(description = "Suggest links for a file. Scans content for mentions of existing note titles (including aliases) that aren't already linked, as a wikilink or a markdown link. Returns suggestions without modifying the file.")]
     async fn library_suggest_links(
         &self,
         params: Parameters<ReadParams>,
@@ -1588,9 +1594,26 @@ mod tests {
     }
 
     #[test]
+    fn markdown_links_are_extracted_conservatively() {
+        let md = "\
+[a](architecture.md) [b](./x/y.md#sec) [c](../up.md) [d](My%20Note.md) [e](<Spaced.md>)
+[ext](https://example.com/a.md) [mail](mailto:a@b.md) [img](pic.png) [anchor](#top)
+[titled](t.md \"Title\") ![embed](emb.md)
+";
+        let got = LibraryServer::extract_markdown_links(md);
+        assert_eq!(
+            got,
+            vec![
+                "architecture.md", "./x/y.md", "../up.md", "My Note.md", "Spaced.md",
+                "t.md", "emb.md",
+            ]
+        );
+    }
+
+    #[test]
     fn wikilinks_are_still_extracted_verbatim() {
-        let got = LibraryServer::extract_links("[[Foo]] and [[bar|alias]]");
-        assert_eq!(got, vec!["Foo", "bar"]);
+        let got = LibraryServer::extract_links("[[Foo]] and [[bar|alias]] and [x](baz.md)");
+        assert_eq!(got, vec!["Foo", "bar", "baz.md"]);
     }
 
     fn test_server(auto_link: bool) -> LibraryServer {
@@ -1605,19 +1628,25 @@ mod tests {
         }
     }
 
-    // Mentions inside an existing markdown link must not be wrapped again.
+    // suggest_links / auto-link must not re-link a note the content already
+    // links to by markdown link, nor wrap text inside an existing link.
     #[test]
-    fn auto_link_skips_text_inside_markdown_links() {
+    fn auto_link_skips_notes_already_linked_by_markdown() {
         let s = test_server(true);
         let titles = vec![(
             "QuantFlow".to_string(),
             "QuantFlow".to_string(),
             "Index/QuantFlow.md".to_string(),
         )];
+        let already = "Read [the notes](../Index/QuantFlow.md). QuantFlow again.";
+        let (out, added) = s.auto_link_content(already, "notes/a.md", &titles);
+        assert_eq!((out.as_str(), added.len()), (already, 0));
+
         let inside = "[all about QuantFlow](https://example.com/x)";
         let (out, added) = s.auto_link_content(inside, "notes/a.md", &titles);
         assert_eq!((out.as_str(), added.len()), (inside, 0));
     }
+
     #[test]
     fn auto_link_can_be_disabled_for_writes_only() {
         let s = test_server(false);
@@ -1672,7 +1701,7 @@ mod tests {
     #[test]
     fn refresh_follows_delete_rename_and_edit() {
         let dir = temp_vault("refresh-all", &[
-            ("a.md", "[[b]] [[sub/c]]"),
+            ("a.md", "[[b]] [c](sub/c.md)"),
             ("b.md", "x"),
             ("sub/c.md", "y"),
         ]);
@@ -1691,7 +1720,7 @@ mod tests {
         assert!(cache.outgoing.contains_key("sub/d") && !cache.outgoing.contains_key("sub/c"));
 
         std::thread::sleep(std::time::Duration::from_millis(30));
-        std::fs::write(dir.join("a.md"), "[[sub/d]]").unwrap();
+        std::fs::write(dir.join("a.md"), "[x](sub/d.md)").unwrap();
         cache.check_and_refresh(&server);
         assert_eq!(cache.outgoing["a"], vec!["sub/d"]);
         assert_eq!(cache.incoming["sub/d"], vec!["a"]);
@@ -1740,14 +1769,14 @@ mod tests {
         }
     }
 
-    // Wikilinks become path-keyed edges; same-named notes in different folders
+    // Markdown links become graph edges; same-named notes in different folders
     // stay distinct nodes; unresolved links are kept apart from real notes.
     #[test]
-    fn wikilinks_build_path_keyed_graph() {
-        let dir = temp_vault("wikigraph", &[
-            ("INDEX.md", "[[architecture]] [[patterns/orm#rows]] [[plans/dup]] [[missing]]"),
+    fn markdown_links_build_graph_edges() {
+        let dir = temp_vault("mdgraph", &[
+            ("INDEX.md", "[arch](architecture.md) [orm](patterns/orm.md#rows) [d](plans/dup.md) [ext](https://x.dev/a.md) [img](pic.png) [gone](missing.md) [out](../README.md)"),
             ("architecture.md", "no links"),
-            ("patterns/orm.md", "[[../architecture]] [[dup]]"),
+            ("patterns/orm.md", "[back](../architecture.md) [d](dup.md)"),
             ("patterns/dup.md", "x"),
             ("plans/dup.md", "y"),
         ]);
@@ -1756,7 +1785,10 @@ mod tests {
 
         let mut index_out = cache.outgoing["INDEX"].clone();
         index_out.sort();
-        assert_eq!(index_out, vec!["?missing", "architecture", "patterns/orm", "plans/dup"]);
+        assert_eq!(
+            index_out,
+            vec!["?missing", "architecture", "patterns/orm", "plans/dup"],
+        );
         let mut orm_out = cache.outgoing["patterns/orm"].clone();
         orm_out.sort();
         assert_eq!(orm_out, vec!["architecture", "patterns/dup"]);

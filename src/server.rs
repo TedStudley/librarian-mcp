@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 
-use crate::cache::VaultCache;
+use crate::cache::{id_from_rel, Resolver, VaultCache};
 
 /// Librarian MCP Server — give Claude a librarian for your markdown vault
 #[derive(Clone)]
@@ -223,6 +223,14 @@ impl LibraryServer {
         let existing_links = Self::extract_wikilinks(content);
         let existing_set: HashSet<&str> = existing_links.iter().map(|s| s.as_str()).collect();
 
+        // Notes this content already links to, by any link style.
+        let resolver = Resolver::new(titles.iter().map(|(_, _, rel)| id_from_rel(rel)));
+        let source_id = id_from_rel(exclude_path);
+        let linked_ids: HashSet<String> = Self::extract_links(content)
+            .iter()
+            .filter_map(|l| resolver.resolve(&source_id, l))
+            .collect();
+
         let mut result = content.to_string();
         let mut links_added = Vec::new();
 
@@ -231,6 +239,7 @@ impl LibraryServer {
             .filter(|(match_term, canonical, rel)| {
                 match_term.len() >= 3
                     && rel != exclude_path
+                    && !linked_ids.contains(&id_from_rel(rel))
                     && !self.link_stoplist.contains(&match_term.to_lowercase())
                     && !self.crosses_isolation(writing_dir, Self::top_folder(rel))
                     && !existing_set.contains(canonical.as_str())
@@ -318,9 +327,61 @@ impl LibraryServer {
             .collect()
     }
 
-    /// All link targets in a note.
+    /// Targets of relative markdown links (`[text](path.md#anchor)`), percent-
+    /// decoded and without the anchor. Skips URLs with a scheme, bare `#anchor`
+    /// links and anything that is not a `.md` target.
+    pub fn extract_markdown_links(content: &str) -> Vec<String> {
+        Self::markdown_links_in(content)
+    }
+
+    fn markdown_links_in(content: &str) -> Vec<String> {
+        static LINK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static SCHEME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let link = LINK.get_or_init(|| {
+            regex::Regex::new(r#"\[[^\]]*\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)"#).unwrap()
+        });
+        let scheme = SCHEME.get_or_init(|| regex::Regex::new(r"^[A-Za-z][A-Za-z0-9+.\-]*:").unwrap());
+
+        let mut out = Vec::new();
+        for caps in link.captures_iter(content) {
+            let href = caps[1].trim_start_matches('<').trim_end_matches('>');
+            if scheme.is_match(href) {
+                continue;
+            }
+            let path = href.split('#').next().unwrap_or("");
+            let decoded = Self::percent_decode(path);
+            if decoded.to_lowercase().ends_with(".md") {
+                out.push(decoded);
+            }
+        }
+        out
+    }
+
+    /// All link targets in a note: wikilinks (verbatim) then markdown links.
     pub fn extract_links(content: &str) -> Vec<String> {
-        Self::extract_wikilinks(content)
+        let mut links = Self::extract_wikilinks(content);
+        links.extend(Self::markdown_links_in(content));
+        links
+    }
+
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).to_string()
     }
 
     /// Graph node id for an absolute path inside a vault.
