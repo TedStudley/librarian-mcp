@@ -1490,4 +1490,25 @@ mod tests {
         assert!(!added.iter().any(|l| l == "POV Tracker"), "must not cross into isolated folder");
         assert!(added.iter().any(|l| l == "QuantFlow"), "non-isolated link still allowed");
     }
+
+    // Mentions inside an existing markdown link must not be wrapped again.
+    #[test]
+    fn auto_link_skips_text_inside_markdown_links() {
+        let server = LibraryServer {
+            library_paths: vec![],
+            default_ignores: vec![],
+            link_stoplist: vec![],
+            isolated_folders: vec![],
+            cache: Arc::new(Mutex::new(VaultCache::default())),
+            tool_router: LibraryServer::new_tool_router(),
+        };
+        let titles = vec![(
+            "QuantFlow".to_string(),
+            "QuantFlow".to_string(),
+            "Index/QuantFlow.md".to_string(),
+        )];
+        let inside = "[all about QuantFlow](https://example.com/x)";
+        let (out, added) = server.auto_link_content(inside, "notes/a.md", &titles);
+        assert_eq!((out.as_str(), added.len()), (inside, 0));
+    }
 }

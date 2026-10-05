@@ -198,6 +198,12 @@ impl LibraryServer {
             zones.push((m.start(), m.end()));
         }
 
+        // Existing markdown links and images: [text](target)
+        let md_links = regex::Regex::new(r"!?\[[^\]]*\]\([^)]*\)").unwrap();
+        for m in md_links.find_iter(text) {
+            zones.push((m.start(), m.end()));
+        }
+
         zones
     }
 
