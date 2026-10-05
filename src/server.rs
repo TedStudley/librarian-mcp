@@ -360,6 +360,29 @@ impl LibraryServer {
                     && !existing_set.contains(match_term.as_str())
             })
             .collect();
+        // A name that matches several notes can't be attributed to any one of
+        // them from prose alone: link it only if exactly one is in the writing
+        // note's own folder.
+        let dir_of = |rel: &str| rel.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
+        let src_dir = dir_of(exclude_path);
+        let mut rels_by_term: std::collections::HashMap<String, Vec<&str>> = std::collections::HashMap::new();
+        for (match_term, _, rel) in &candidates {
+            let rels = rels_by_term.entry(match_term.to_lowercase()).or_default();
+            if !rels.contains(&rel.as_str()) {
+                rels.push(rel.as_str());
+            }
+        }
+        let keep: Vec<bool> = candidates
+            .iter()
+            .map(|(match_term, _, rel)| {
+                let rels = &rels_by_term[&match_term.to_lowercase()];
+                rels.len() <= 1
+                    || (dir_of(rel) == src_dir
+                        && rels.iter().filter(|r| dir_of(r) == src_dir).count() == 1)
+            })
+            .collect();
+        let mut keep_iter = keep.into_iter();
+        candidates.retain(|_| keep_iter.next().unwrap_or(false));
         candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         let mut linked_stems: HashSet<String> = HashSet::new();

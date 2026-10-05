@@ -173,7 +173,7 @@ The link style follows the vault's own Obsidian settings, read from `.obsidian/a
 | `true` | `relative` | `[Note](../folder/Note.md)`; same-folder links are `[Note](./Note.md)` |
 | `true` | `shortest` / `absolute` | `[Note](folder/Note.md)` (vault-root path) |
 
-Markdown links never rely on a bare file name, so a note added later can't make them ambiguous. Frontmatter aliases are supported.
+Markdown links never rely on a bare file name, so a note added later can't make them ambiguous. A mention that matches several same-named notes is linked only if exactly one of them is in the writing note's own folder. Frontmatter aliases are supported.
 
 To turn auto-linking off, run with `--no-autolink` or set `LIBRARIAN_AUTOLINK=off`. `library_suggest_links` still reports suggestions, and it skips notes that are already linked by wikilink or markdown link.
 

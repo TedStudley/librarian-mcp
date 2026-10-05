@@ -1785,6 +1785,27 @@ Link text with code: [`code`](textcode.md)
         assert_eq!((out.as_str(), added.len()), (inside, 0));
     }
 
+    // A mention that matches several same-named notes is linked only when
+    // exactly one of them sits in the writing note's own folder.
+    #[test]
+    fn auto_link_skips_ambiguous_names_unless_same_folder() {
+        use crate::server::LinkFormat;
+        let s = styled_server(LinkStyle::Markdown(LinkFormat::Relative), true);
+        let titles = vec![
+            ("room-unlocking".to_string(), "room-unlocking".to_string(), "features/room-unlocking.md".to_string()),
+            ("room-unlocking".to_string(), "room-unlocking".to_string(), "plans/room-unlocking.md".to_string()),
+            ("hand-entry-forms".to_string(), "hand-entry-forms".to_string(), "patterns/hand-entry-forms.md".to_string()),
+            ("hand-entry-forms".to_string(), "hand-entry-forms".to_string(), "plans/hand-entry-forms.md".to_string()),
+        ];
+        let text = "See room-unlocking and hand-entry-forms.";
+        let (out, added) = s.auto_link_content(text, "patterns/new.md", &titles);
+        assert_eq!(out, "See room-unlocking and [hand-entry-forms](./hand-entry-forms.md).");
+        assert_eq!(added, vec!["hand-entry-forms"]);
+        // Written from a folder with no same-named note: neither is linked.
+        let (out, added) = s.auto_link_content(text, "other/new.md", &titles);
+        assert_eq!((out.as_str(), added.len()), (text, 0));
+    }
+
     #[test]
     fn auto_link_can_be_disabled_for_writes_only() {
         let s = styled_server(LinkStyle::Wikilink, false);
