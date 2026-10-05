@@ -179,7 +179,7 @@ Notes are graph nodes identified by their vault-relative path (`plans/room-unloc
 2. a path relative to the linking file;
 3. a name or path-suffix match anywhere in the vault: the shortest full path wins, then byte-wise lexicographic order.
 
-`http(s)`/`mailto:` URLs, non-`.md` targets and links that leave the vault are skipped. Unresolved links appear as `?target` nodes. Tools that take a note (`library_links`, `library_traverse`, `library_shortest_path`) accept a path or a bare name, and `library_stats` lists `duplicate_names`.
+Links inside fenced code, indented code, inline code and HTML comments are ignored, as are `http(s)`/`mailto:` URLs, non-`.md` targets, and links that leave the vault. Unresolved links appear as `?target` nodes. Tools that take a note (`library_links`, `library_traverse`, `library_shortest_path`) accept a path or a bare name, and `library_stats` lists `duplicate_names`.
 
 ### Knowledge graph traversal
 

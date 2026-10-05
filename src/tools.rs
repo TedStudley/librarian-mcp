@@ -1599,13 +1599,18 @@ mod tests {
 [a](architecture.md) [b](./x/y.md#sec) [c](../up.md) [d](My%20Note.md) [e](<Spaced.md>)
 [ext](https://example.com/a.md) [mail](mailto:a@b.md) [img](pic.png) [anchor](#top)
 [titled](t.md \"Title\") ![embed](emb.md)
+`[inline](code.md)`
+```sh
+[fenced](fence.md)
+```
+after the fence, `code` then [kept](kept.md) then `more code`
 ";
         let got = LibraryServer::extract_markdown_links(md);
         assert_eq!(
             got,
             vec![
                 "architecture.md", "./x/y.md", "../up.md", "My Note.md", "Spaced.md",
-                "t.md", "emb.md",
+                "t.md", "emb.md", "kept.md",
             ]
         );
     }
@@ -1614,6 +1619,41 @@ mod tests {
     fn wikilinks_are_still_extracted_verbatim() {
         let got = LibraryServer::extract_links("[[Foo]] and [[bar|alias]] and [x](baz.md)");
         assert_eq!(got, vec!["Foo", "bar", "baz.md"]);
+    }
+
+    // Measured in Obsidian: links inside inline code, fenced code, indented
+    // code and HTML comments are not indexed.
+    #[test]
+    fn links_in_code_and_comments_are_ignored() {
+        let md = "\
+Plain: [[Real]] and [r](real.md)
+
+Inline: `[[Inline]]` and `[x](inline.md)`
+
+```
+[[Fenced]] [x](fenced.md)
+```
+
+Indented:
+
+    [[Indented]] [x](indented.md)
+
+HTML: <!-- [[Html]] [x](html.md)
+spanning lines -->
+
+Link text with code: [`code`](textcode.md)
+";
+        let got = LibraryServer::extract_links(md);
+        assert_eq!(got, vec!["Real", "real.md", "textcode.md"]);
+    }
+
+    // An indented paragraph after a blank line inside a list item is a list
+    // continuation, not a code block, so its links still count.
+    #[test]
+    fn indented_list_continuation_is_not_code() {
+        let md = "- item\n\n    [[Kept]] continuation\n\n1. step\n\n    [x](kept.md)\n";
+        let got = LibraryServer::extract_links(md);
+        assert_eq!(got, vec!["Kept", "kept.md"]);
     }
 
     fn test_server(auto_link: bool) -> LibraryServer {
@@ -1661,6 +1701,16 @@ mod tests {
         // Suggestions still work with auto-linking off.
         let (_, suggestions) = s.auto_link_content(text, "notes/a.md", &titles);
         assert_eq!(suggestions, vec!["QuantFlow"]);
+    }
+
+    #[test]
+    fn masking_handles_non_ascii_and_crlf() {
+        let md = "héllo `[[Inline]]` ünï [[Real]]\n\n```\n[[Fenced]] 日本語\n```\n\nafter [x](after.md) 日本 <!-- [[Html]] --> end [[Last]]\n";
+        let expected = vec!["Real", "Last", "after.md"];
+        assert_eq!(LibraryServer::extract_links(md), expected);
+        assert_eq!(LibraryServer::extract_links(&md.replace('\n', "\r\n")), expected);
+        // Tab-indented code is code too.
+        assert_eq!(LibraryServer::extract_links("text\n\n\t[[Tabbed]]\n\n[[Kept]]\n"), vec!["Kept"]);
     }
 
     #[test]

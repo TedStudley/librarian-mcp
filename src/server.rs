@@ -327,14 +327,91 @@ impl LibraryServer {
             .collect()
     }
 
-    /// Targets of relative markdown links (`[text](path.md#anchor)`), percent-
-    /// decoded and without the anchor. Skips URLs with a scheme, bare `#anchor`
-    /// links and anything that is not a `.md` target.
-    pub fn extract_markdown_links(content: &str) -> Vec<String> {
-        Self::markdown_links_in(content)
+    /// Copy of `content` with everything Obsidian does not index links from
+    /// blanked out (same byte length, newlines kept): fenced code, HTML
+    /// comments, indented code blocks and inline code.
+    pub fn mask_non_prose(content: &str) -> String {
+        static FENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static COMMENT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static INLINE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static LIST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let fence = FENCE.get_or_init(|| {
+            regex::Regex::new(r"(?ms)^ {0,3}(?:```|~~~)[^\n]*\n.*?^ {0,3}(?:```|~~~)").unwrap()
+        });
+        let comment = COMMENT.get_or_init(|| regex::Regex::new(r"(?s)<!--.*?-->").unwrap());
+        let inline = INLINE.get_or_init(|| regex::Regex::new(r"`[^`\n]+`").unwrap());
+        let list = LIST.get_or_init(|| regex::Regex::new(r"^\s*(?:[-*+]|\d{1,9}[.)])\s").unwrap());
+
+        fn blank(bytes: &mut [u8], start: usize, end: usize) {
+            for b in &mut bytes[start..end] {
+                if *b != b'\n' {
+                    *b = b' ';
+                }
+            }
+        }
+        // The masked buffer only ever has whole characters replaced by spaces.
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+
+        let mut bytes = content.as_bytes().to_vec();
+        for m in fence.find_iter(content) {
+            blank(&mut bytes, m.start(), m.end());
+        }
+        let after_fences = text(&bytes);
+        for m in comment.find_iter(&after_fences) {
+            blank(&mut bytes, m.start(), m.end());
+        }
+
+        // Indented code: a 4-space/tab run that follows a blank line, outside
+        // any list (inside a list it is a continuation paragraph).
+        let current = text(&bytes);
+        let mut offset = 0usize;
+        let (mut prev_blank, mut in_list, mut in_code) = (true, false, false);
+        for line in current.split_inclusive('\n') {
+            let (start, end) = (offset, offset + line.len());
+            offset = end;
+            let body = line.trim_end_matches('\n');
+            if body.trim().is_empty() {
+                prev_blank = true;
+                continue;
+            }
+            let indented = body.starts_with("    ") || body.starts_with('\t');
+            if in_code && indented {
+                blank(&mut bytes, start, end);
+                continue;
+            }
+            in_code = false;
+            if indented && prev_blank && !in_list {
+                in_code = true;
+                blank(&mut bytes, start, end);
+                prev_blank = false;
+                continue;
+            }
+            if list.is_match(body) {
+                in_list = true;
+            } else if !indented {
+                in_list = false;
+            }
+            prev_blank = false;
+        }
+
+        let after_indent = text(&bytes);
+        for m in inline.find_iter(&after_indent) {
+            blank(&mut bytes, m.start(), m.end());
+        }
+        text(&bytes)
     }
 
-    fn markdown_links_in(content: &str) -> Vec<String> {
+    /// Targets of relative markdown links (`[text](path.md#anchor)`), percent-
+    /// decoded and without the anchor. Skips links inside code or comments,
+    /// URLs with a scheme, bare `#anchor` links and anything that is not a
+    /// `.md` target.
+    pub fn extract_markdown_links(content: &str) -> Vec<String> {
+        Self::markdown_links_in(&Self::mask_non_prose(content))
+    }
+
+    fn markdown_links_in(masked: &str) -> Vec<String> {
         static LINK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         static SCHEME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let link = LINK.get_or_init(|| {
@@ -343,7 +420,7 @@ impl LibraryServer {
         let scheme = SCHEME.get_or_init(|| regex::Regex::new(r"^[A-Za-z][A-Za-z0-9+.\-]*:").unwrap());
 
         let mut out = Vec::new();
-        for caps in link.captures_iter(content) {
+        for caps in link.captures_iter(masked) {
             let href = caps[1].trim_start_matches('<').trim_end_matches('>');
             if scheme.is_match(href) {
                 continue;
@@ -357,10 +434,12 @@ impl LibraryServer {
         out
     }
 
-    /// All link targets in a note: wikilinks (verbatim) then markdown links.
+    /// All link targets in a note: wikilinks (verbatim) then markdown links,
+    /// ignoring anything inside code or HTML comments.
     pub fn extract_links(content: &str) -> Vec<String> {
-        let mut links = Self::extract_wikilinks(content);
-        links.extend(Self::markdown_links_in(content));
+        let masked = Self::mask_non_prose(content);
+        let mut links = Self::extract_wikilinks(&masked);
+        links.extend(Self::markdown_links_in(&masked));
         links
     }
 
