@@ -153,9 +153,7 @@ pub fn evaluate(
             c.search_index
                 .search(q, 300)
                 .iter()
-                .filter_map(|(p, _, s)| {
-                    p.file_stem().map(|st| (st.to_string_lossy().to_string(), *s))
-                })
+                .map(|(p, _, s)| (server.node_id(p), *s))
                 .collect()
         };
         if scored.len() < 2 {

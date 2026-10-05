@@ -6,7 +6,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use crate::server::LibraryServer;
 use crate::graph;
@@ -114,7 +113,7 @@ pub struct ImportParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraverseParams {
-    /// Note title (file stem) to start traversal from
+    /// Note to start traversal from: a vault path (plans/x) or a bare note name
     pub start: String,
     /// Maximum number of hops (default 2)
     pub depth: Option<usize>,
@@ -128,9 +127,9 @@ pub struct TraverseParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ShortestPathParams {
-    /// Starting note title (file stem)
+    /// Starting note: a vault path (plans/x) or a bare note name
     pub from: String,
-    /// Target note title (file stem)
+    /// Target note: a vault path (plans/x) or a bare note name
     pub to: String,
 }
 
@@ -144,6 +143,19 @@ pub struct VisualizeParams {
 pub struct ReportParams {
     /// Output file path within the vault (defaults to GRAPH_REPORT.md in vault root)
     pub output_path: Option<String>,
+}
+
+/// When a bare name matched several notes, say which one was used and what
+/// else it could have meant, instead of silently answering for one of them.
+fn note_ambiguity(result: &mut serde_json::Value, field: &str, used: &str, others: &[String]) {
+    if others.is_empty() {
+        return;
+    }
+    result["ambiguous"][field] = serde_json::json!({
+        "used": used,
+        "also_matches": others.iter().filter(|o| o.as_str() != used).collect::<Vec<_>>(),
+        "hint": "pass a full path such as the ones above to choose a specific note",
+    });
 }
 
 // A stem is orphan iff it has zero outgoing AND zero incoming edges in the
@@ -221,7 +233,7 @@ impl LibraryServer {
         }
     }
 
-    #[tool(description = "Write or create a file in the library. Auto-links mentions of existing notes as [[wikilinks]] using canonical file names for Obsidian graph compatibility. Creates parent directories if needed.")]
+    #[tool(description = "Write or create a file in the library. Auto-links mentions of existing notes in the vault's own link style (read from .obsidian/app.json: [[wikilinks]] or relative/absolute markdown links) unless auto-linking is disabled (--no-autolink or LIBRARIAN_AUTOLINK=off). Creates parent directories if needed.")]
     async fn library_write(
         &self,
         params: Parameters<WriteParams>,
@@ -234,7 +246,7 @@ impl LibraryServer {
             let cache = self.cache.lock().unwrap();
             cache.titles.clone()
         };
-        let (linked_content, links_added) = self.auto_link_content(&params.0.content, &params.0.path, &titles);
+        let (linked_content, links_added) = self.maybe_auto_link(&params.0.content, &params.0.path, &titles);
         match std::fs::write(&full, &linked_content) {
             Ok(_) => {
                 if let Ok(mut cache) = self.cache.lock() {
@@ -260,8 +272,14 @@ impl LibraryServer {
                         let mut suggestions: Vec<(String, String)> = Vec::new();
 
                         if let Ok(cache) = self.cache.lock() {
+                            // Notes that already link here, in any link style.
+                            let already: HashSet<&String> = cache
+                                .incoming
+                                .get(&self.node_id(&full))
+                                .map(|v| v.iter().collect())
+                                .unwrap_or_default();
                             for (path, content) in &cache.search_index.files {
-                                if path == &full {
+                                if path == &full || already.contains(&self.node_id(path)) {
                                     continue;
                                 }
                                 let content_lower = content.to_lowercase();
@@ -373,24 +391,24 @@ impl LibraryServer {
         &self,
         params: Parameters<LinksParams>,
     ) -> Result<CallToolResult, McpError> {
-        let target_name = Path::new(&params.0.path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
         let mut cache = self.cache.lock().unwrap();
         cache.check_and_refresh(self);
+        let target_name = cache
+            .resolve_input(&params.0.path)
+            .unwrap_or_else(|| crate::cache::id_from_rel(&params.0.path));
         let outgoing_links = cache.outgoing.get(&target_name).cloned().unwrap_or_default();
         let backlinks: Vec<String> = cache.incoming.get(&target_name).cloned().unwrap_or_default();
+        let ambiguous = cache.input_ambiguity(&params.0.path);
         drop(cache);
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "file": params.0.path,
             "backlinks": backlinks,
             "outgoing": outgoing_links,
             "backlink_count": backlinks.len(),
             "outgoing_count": outgoing_links.len(),
         });
+        note_ambiguity(&mut result, "path", &target_name, &ambiguous);
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -485,13 +503,11 @@ impl LibraryServer {
     async fn library_stats(&self) -> Result<CallToolResult, McpError> {
         let files = self.all_md_files();
         let mut total_words = 0usize;
-        let mut total_links = 0usize;
         let mut tag_count = HashSet::new();
 
         for path in &files {
             if let Ok(content) = std::fs::read_to_string(path) {
                 total_words += content.split_whitespace().count();
-                total_links += Self::extract_wikilinks(&content).len();
                 for tag in Self::extract_tags(&content) { tag_count.insert(tag); }
             }
         }
@@ -501,17 +517,15 @@ impl LibraryServer {
         // incoming-only check flagged any file that nothing linked TO as orphan
         // — even if it had outgoing wikilinks — which contradicted the graph
         // tool and surprised callers right after `library_write` auto-linked.
-        let (outgoing, incoming) = {
+        let (outgoing, incoming, duplicate_names) = {
             let mut cache = self.cache.lock().unwrap();
             cache.check_and_refresh(self);
-            (cache.outgoing.clone(), cache.incoming.clone())
+            (cache.outgoing.clone(), cache.incoming.clone(), cache.resolver.duplicate_names())
         };
+        let total_links: usize = outgoing.values().map(|v| v.len()).sum();
 
         let orphans: Vec<_> = files.iter()
-            .filter(|p| {
-                let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                is_orphan_stem(&stem, &outgoing, &incoming)
-            })
+            .filter(|p| is_orphan_stem(&self.node_id(p), &outgoing, &incoming))
             .map(|p| self.relative_path(p))
             .collect();
 
@@ -523,6 +537,10 @@ impl LibraryServer {
             "unique_tags": tag_count.len(),
             "orphan_count": orphans.len(),
             "orphans_sample": &orphans[..orphans.len().min(10)],
+            // Bare references to these names are ambiguous; tools never guess.
+            "duplicate_names": duplicate_names.iter().take(20)
+                .map(|(name, ids)| serde_json::json!({ "name": name, "notes": ids }))
+                .collect::<Vec<_>>(),
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -530,7 +548,7 @@ impl LibraryServer {
         )]))
     }
 
-    #[tool(description = "Suggest wikilinks for a file. Scans content for mentions of existing note titles (including aliases) that aren't already linked. Returns suggestions without modifying the file.")]
+    #[tool(description = "Suggest links for a file. Scans content for mentions of existing note titles (including aliases) that aren't already linked, as a wikilink or a markdown link. Returns suggestions without modifying the file.")]
     async fn library_suggest_links(
         &self,
         params: Parameters<ReadParams>,
@@ -571,9 +589,13 @@ impl LibraryServer {
         params: Parameters<TraverseParams>,
     ) -> Result<CallToolResult, McpError> {
         let max_depth = params.0.depth.unwrap_or(2);
-        let start = &params.0.start;
         let mut cache_guard = self.cache.lock().unwrap();
         cache_guard.check_and_refresh(self);
+        let start_id = cache_guard
+            .resolve_input(&params.0.start)
+            .unwrap_or_else(|| params.0.start.clone());
+        let start = &start_id;
+        let start_ambiguous = cache_guard.input_ambiguity(&params.0.start);
         let outgoing = cache_guard.outgoing.clone();
         let incoming = cache_guard.incoming.clone();
         drop(cache_guard);
@@ -611,8 +633,7 @@ impl LibraryServer {
             .filter(|(node, _)| match &params.0.tag_filter {
                 None => true,
                 Some(tag_filter) => self.all_md_files().iter().any(|p| {
-                    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    if &stem != *node { return false; }
+                    if &self.node_id(p) != *node { return false; }
                     if let Ok(content) = std::fs::read_to_string(p) {
                         Self::extract_tags(&content).iter().any(|t| t == tag_filter)
                     } else { false }
@@ -627,9 +648,7 @@ impl LibraryServer {
             Some(q) => {
                 let cache = self.cache.lock().unwrap();
                 cache.search_index.search(q, 300).iter()
-                    .filter_map(|(p, _, s)| {
-                        p.file_stem().map(|st| (st.to_string_lossy().to_string(), *s))
-                    })
+                    .map(|(p, _, s)| (self.node_id(p), *s))
                     .collect()
             }
             None => HashMap::new(),
@@ -664,7 +683,7 @@ impl LibraryServer {
         unique_edges.sort();
         unique_edges.dedup();
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "start": start,
             "max_depth": max_depth,
             "nodes_found": nodes.len(),
@@ -673,6 +692,7 @@ impl LibraryServer {
                 .map(|(a, b)| serde_json::json!({ "from": a, "to": b }))
                 .collect::<Vec<_>>(),
         });
+        note_ambiguity(&mut result, "start", start, &start_ambiguous);
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -684,10 +704,14 @@ impl LibraryServer {
         &self,
         params: Parameters<ShortestPathParams>,
     ) -> Result<CallToolResult, McpError> {
-        let from = &params.0.from;
-        let to = &params.0.to;
         let mut cache_guard = self.cache.lock().unwrap();
         cache_guard.check_and_refresh(self);
+        let from_id = cache_guard.resolve_input(&params.0.from).unwrap_or_else(|| params.0.from.clone());
+        let to_id = cache_guard.resolve_input(&params.0.to).unwrap_or_else(|| params.0.to.clone());
+        let from = &from_id;
+        let to = &to_id;
+        let from_ambiguous = cache_guard.input_ambiguity(&params.0.from);
+        let to_ambiguous = cache_guard.input_ambiguity(&params.0.to);
         let outgoing = cache_guard.outgoing.clone();
         let incoming = cache_guard.incoming.clone();
         drop(cache_guard);
@@ -722,13 +746,16 @@ impl LibraryServer {
         }
 
         if !found {
+            let mut result = serde_json::json!({
+                "from": from,
+                "to": to,
+                "path": null,
+                "message": "No path found between these notes"
+            });
+            note_ambiguity(&mut result, "from", from, &from_ambiguous);
+            note_ambiguity(&mut result, "to", to, &to_ambiguous);
             return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "from": from,
-                    "to": to,
-                    "path": null,
-                    "message": "No path found between these notes"
-                })).unwrap_or_default(),
+                serde_json::to_string_pretty(&result).unwrap_or_default(),
             )]));
         }
 
@@ -740,12 +767,14 @@ impl LibraryServer {
         }
         path.reverse();
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "from": from,
             "to": to,
             "hops": path.len() - 1,
             "path": path,
         });
+        note_ambiguity(&mut result, "from", from, &from_ambiguous);
+        note_ambiguity(&mut result, "to", to, &to_ambiguous);
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -839,7 +868,7 @@ impl LibraryServer {
         )]))
     }
 
-    #[tool(description = "Import any document (PDF, DOCX, XLSX, image, audio, etc.) into the library as markdown. Uses MarkItDown to convert, then saves with frontmatter and auto-linked wikilinks.")]
+    #[tool(description = "Import any document (PDF, DOCX, XLSX, image, audio, etc.) into the library as markdown. Uses MarkItDown to convert, then saves with frontmatter and auto-linked mentions (in the vault's link style).")]
     async fn library_import(
         &self,
         params: Parameters<ImportParams>,
@@ -891,7 +920,7 @@ impl LibraryServer {
             let cache = self.cache.lock().unwrap();
             cache.titles.clone()
         };
-        let (linked_content, links_added) = self.auto_link_content(&content, lib_path, &titles);
+        let (linked_content, links_added) = self.maybe_auto_link(&content, lib_path, &titles);
         let full_path = self.resolve_path(lib_path);
         if let Some(parent) = full_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1034,6 +1063,15 @@ impl LibraryServer {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "Vault".to_string());
 
+        let rel_path = params.0.output_path.unwrap_or_else(|| "GRAPH_REPORT.md".to_string());
+        let report_id = crate::cache::id_from_rel(&rel_path);
+        let resolver = self.cache.lock().unwrap().resolver.clone();
+        // Unresolved `?target` nodes are not notes: print them as plain text.
+        let link = |id: &str| match id.strip_prefix('?') {
+            Some(missing) => missing.to_string(),
+            None => self.format_link(&resolver, &report_id, id, None),
+        };
+
         let report_md = report::generate_report(
             &vault_name,
             all_nodes.len(),
@@ -1043,9 +1081,9 @@ impl LibraryServer {
             &surprising,
             orphan_count,
             &community_of,
+            &link,
         );
 
-        let rel_path = params.0.output_path.unwrap_or_else(|| "GRAPH_REPORT.md".to_string());
         let full = self.resolve_path(&rel_path);
         if let Some(parent) = full.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1135,13 +1173,17 @@ impl LibraryServer {
             match std::fs::write(&note_path, &body) {
                 Ok(_) => {
                     if let Ok(mut cache) = self.cache.lock() {
-                        cache.update_single_file(&note_path, &body, self);
+                        cache.update_file_deferred(&note_path, &body, self);
                     }
                     total_links += related;
                     lines.push(format!("  {} — {} notes / {} dirs", topic, related, dirs));
                 }
                 Err(e) => lines.push(format!("  {} — FAILED: {}", topic, e)),
             }
+        }
+
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.refresh_graph();
         }
 
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1248,14 +1290,15 @@ impl LibraryServer {
             let date = chrono::Local::now().format("%Y-%m-%d").to_string();
             let backup = root.join(format!(".optimize-bak-{}", date));
 
-            // stem -> relative path for resolving densify targets.
-            let stem_to_rel: HashMap<String, String> = {
+            // node id -> relative path for resolving densify targets, plus a
+            // resolver snapshot for spelling links in the vault's style.
+            let (stem_to_rel, resolver): (HashMap<String, String>, crate::cache::Resolver) = {
                 let c = self.cache.lock().unwrap();
                 let mut m = HashMap::new();
-                for (_t, canonical, rel) in &c.titles {
-                    m.entry(canonical.clone()).or_insert_with(|| rel.clone());
+                for (_t, _canonical, rel) in &c.titles {
+                    m.entry(crate::cache::id_from_rel(rel)).or_insert_with(|| rel.clone());
                 }
-                m
+                (m, c.resolver.clone())
             };
 
             // Hubs: write a MOC linking exactly the planned community members.
@@ -1283,16 +1326,20 @@ impl LibraryServer {
                 );
                 for (dir, stems) in &by_dir {
                     body.push_str(&format!("\n## {}\n\n", dir));
-                    let mut s = stems.clone();
+                    let hub_id = format!("Index/{}", label);
+                    let mut s: Vec<String> = stems
+                        .iter()
+                        .map(|id| self.format_link(&resolver, &hub_id, id, None))
+                        .collect();
                     s.sort();
                     for st in s {
-                        body.push_str(&format!("- [[{}]]\n", st));
+                        body.push_str(&format!("- {}\n", st));
                     }
                 }
                 let _ = std::fs::create_dir_all(note_path.parent().unwrap());
                 if std::fs::write(&note_path, &body).is_ok() {
                     if let Ok(mut c) = self.cache.lock() {
-                        c.update_single_file(&note_path, &body, self);
+                        c.update_file_deferred(&note_path, &body, self);
                     }
                 }
             }
@@ -1305,12 +1352,19 @@ impl LibraryServer {
                 let bak = backup.join(rel);
                 if let Some(p) = bak.parent() { let _ = std::fs::create_dir_all(p); }
                 let _ = std::fs::write(&bak, &content);
-                let updated = Self::upsert_related_block(&content, peers);
+                let peer_text: Vec<String> = peers
+                    .iter()
+                    .map(|p| self.format_link(&resolver, stem, p, None))
+                    .collect();
+                let updated = Self::upsert_related_block(&content, &peer_text);
                 if std::fs::write(&path, &updated).is_ok() {
                     if let Ok(mut c) = self.cache.lock() {
-                        c.update_single_file(&path, &updated, self);
+                        c.update_file_deferred(&path, &updated, self);
                     }
                 }
+            }
+            if let Ok(mut c) = self.cache.lock() {
+                c.refresh_graph();
             }
             applied_note = format!(
                 "\nAPPLIED. Backed up touched notes to .optimize-bak-{}/\n",
@@ -1357,12 +1411,12 @@ impl LibraryServer {
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
 
-    /// Insert or replace a managed `## Related (auto)` block of wikilinks.
+    /// Insert or replace a managed `## Related (auto)` block of pre-formatted links.
     fn upsert_related_block(content: &str, peers: &[String]) -> String {
         const MARK: &str = "## Related (auto)";
         let links = peers
             .iter()
-            .map(|p| format!("- [[{}]]", p))
+            .map(|p| format!("- {}", p))
             .collect::<Vec<_>>()
             .join("\n");
         let block = format!("{}\n\n{}\n", MARK, links);
@@ -1394,6 +1448,7 @@ impl ServerHandler for LibraryServer {
 mod tests {
     use super::*;
     use crate::cache::VaultCache;
+    use crate::server::LinkStyle;
     use std::sync::{Arc, Mutex};
 
     // Regression guard: a refactor or rmcp bump must not silently drop the
@@ -1406,6 +1461,8 @@ mod tests {
             default_ignores: vec![],
             link_stoplist: vec![],
             isolated_folders: vec![],
+            auto_link: true,
+            link_style: LinkStyle::Wikilink,
             cache: Arc::new(Mutex::new(VaultCache::default())),
             tool_router: LibraryServer::new_tool_router(),
         };
@@ -1424,6 +1481,8 @@ mod tests {
             default_ignores: vec![],
             link_stoplist: vec!["claude".to_string()],
             isolated_folders: vec![],
+            auto_link: true,
+            link_style: LinkStyle::Wikilink,
             cache: Arc::new(Mutex::new(VaultCache::default())),
             tool_router: LibraryServer::new_tool_router(),
         };
@@ -1474,6 +1533,8 @@ mod tests {
             default_ignores: vec![],
             link_stoplist: vec![],
             isolated_folders: vec!["Threshold".to_string()],
+            auto_link: true,
+            link_style: LinkStyle::Wikilink,
             cache: Arc::new(Mutex::new(VaultCache::default())),
             tool_router: LibraryServer::new_tool_router(),
         };
@@ -1489,5 +1550,504 @@ mod tests {
         );
         assert!(!added.iter().any(|l| l == "POV Tracker"), "must not cross into isolated folder");
         assert!(added.iter().any(|l| l == "QuantFlow"), "non-isolated link still allowed");
+    }
+
+    fn resolver(ids: &[&str]) -> crate::cache::Resolver {
+        crate::cache::Resolver::new(ids.iter().map(|s| s.to_string()))
+    }
+
+    // Order measured against Obsidian: vault-root path, then path relative to
+    // the linking file, then name/suffix lookup.
+    #[test]
+    fn resolver_precedence_matches_obsidian() {
+        // Root path beats a relative hit.
+        let r = resolver(&["Foo", "b/Foo", "b/src"]);
+        assert_eq!(r.resolve("b/src", "Foo.md").as_deref(), Some("Foo"));
+        // Without the root file, the relative hit wins over a shorter name match.
+        let r = resolver(&["b/Foo", "b/sub/Foo", "b/sub/src", "a/Foo"]);
+        assert_eq!(r.resolve("b/sub/src", "Foo.md").as_deref(), Some("b/sub/Foo"));
+        // Vault-root folder path beats relative folder path.
+        let r = resolver(&["a/Foo", "b/a/Foo", "b/src"]);
+        assert_eq!(r.resolve("b/src", "a/Foo.md").as_deref(), Some("a/Foo"));
+        // `..` is resolved relative to the source.
+        let r = resolver(&["a/Foo", "b/src"]);
+        assert_eq!(r.resolve("b/src", "../a/Foo.md").as_deref(), Some("a/Foo"));
+        // Escaping the vault never resolves.
+        assert_eq!(r.resolve("b/src", "../../x.md"), None);
+    }
+
+    // Name lookup: shortest full path wins, then byte-wise lexicographic order.
+    #[test]
+    fn resolver_name_lookup_tie_break() {
+        let r = resolver(&["len/a/x/Len", "len/mmmmmmmmmmmmmmmm/Len", "len/z/Len", "src"]);
+        assert_eq!(r.resolve("src", "Len").as_deref(), Some("len/z/Len"));
+        let r = resolver(&["tie/zz/Tie", "tie/b/Tie", "tie/c/Tie", "src"]);
+        assert_eq!(r.resolve("src", "Tie").as_deref(), Some("tie/b/Tie"));
+        // Byte order: uppercase sorts before lowercase.
+        let r = resolver(&["case/a/Zed", "case/B/Zed", "src"]);
+        assert_eq!(r.resolve("src", "Zed").as_deref(), Some("case/B/Zed"));
+        // Path-qualified names match as a path suffix.
+        let r = resolver(&["b/Foo", "b/sub/Foo", "src"]);
+        assert_eq!(r.resolve("src", "sub/Foo").as_deref(), Some("b/sub/Foo"));
+    }
+
+    #[test]
+    fn resolver_strips_anchors_and_reports_unresolved() {
+        let r = resolver(&["notes/Foo", "src"]);
+        assert_eq!(r.resolve("src", "Foo#Heading").as_deref(), Some("notes/Foo"));
+        assert_eq!(r.resolve("src", "Foo^block").as_deref(), Some("notes/Foo"));
+        assert_eq!(r.resolve("src", "Missing"), None);
+        assert_eq!(r.resolve("src", "#only-heading"), None);
+    }
+
+    #[test]
+    fn link_text_qualifies_only_when_name_is_ambiguous() {
+        let r = resolver(&["Unique", "a/Dup", "b/sub/Dup"]);
+        // Unique name: bare. Ambiguous name: full vault path for every
+        // candidate, including the one that would win the name lookup.
+        assert_eq!(r.link_text("Unique"), "Unique");
+        assert_eq!(r.link_text("a/Dup"), "a/Dup");
+        assert_eq!(r.link_text("b/sub/Dup"), "b/sub/Dup");
+    }
+
+    #[test]
+    fn markdown_links_are_extracted_conservatively() {
+        let md = "\
+[a](architecture.md) [b](./x/y.md#sec) [c](../up.md) [d](My%20Note.md) [e](<Spaced.md>)
+[ext](https://example.com/a.md) [mail](mailto:a@b.md) [img](pic.png) [anchor](#top)
+[titled](t.md \"Title\") ![embed](emb.md)
+`[inline](code.md)`
+```sh
+[fenced](fence.md)
+```
+after the fence, `code` then [kept](kept.md) then `more code`
+";
+        let got = LibraryServer::extract_markdown_links(md);
+        assert_eq!(
+            got,
+            vec![
+                "architecture.md", "./x/y.md", "../up.md", "My Note.md", "Spaced.md",
+                "t.md", "emb.md", "kept.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn wikilinks_are_still_extracted_verbatim() {
+        let got = LibraryServer::extract_links("[[Foo]] and [[bar|alias]] and [x](baz.md)");
+        assert_eq!(got, vec!["Foo", "bar", "baz.md"]);
+    }
+
+    // Measured in Obsidian: links inside inline code, fenced code, indented
+    // code and HTML comments are not indexed.
+    #[test]
+    fn links_in_code_and_comments_are_ignored() {
+        let md = "\
+Plain: [[Real]] and [r](real.md)
+
+Inline: `[[Inline]]` and `[x](inline.md)`
+
+```
+[[Fenced]] [x](fenced.md)
+```
+
+Indented:
+
+    [[Indented]] [x](indented.md)
+
+HTML: <!-- [[Html]] [x](html.md)
+spanning lines -->
+
+Link text with code: [`code`](textcode.md)
+";
+        let got = LibraryServer::extract_links(md);
+        assert_eq!(got, vec!["Real", "real.md", "textcode.md"]);
+    }
+
+    // An indented paragraph after a blank line inside a list item is a list
+    // continuation, not a code block, so its links still count.
+    #[test]
+    fn indented_list_continuation_is_not_code() {
+        let md = "- item\n\n    [[Kept]] continuation\n\n1. step\n\n    [x](kept.md)\n";
+        let got = LibraryServer::extract_links(md);
+        assert_eq!(got, vec!["Kept", "kept.md"]);
+    }
+
+    fn styled_server(style: LinkStyle, auto_link: bool) -> LibraryServer {
+        LibraryServer {
+            library_paths: vec![],
+            default_ignores: vec![],
+            link_stoplist: vec![],
+            isolated_folders: vec![],
+            auto_link,
+            link_style: style,
+            cache: Arc::new(Mutex::new(VaultCache::default())),
+            tool_router: LibraryServer::new_tool_router(),
+        }
+    }
+
+    fn rel_vault() -> crate::cache::Resolver {
+        resolver(&[
+            "rel/deep/x/src", "rel/deep/x/Sibling", "rel/deep/Parent", "rel/Top",
+            "rel/other/Uniq", "rel/other/My Note", "RootNote", "rel/amb1/Dup", "rel/amb2/Dup",
+        ])
+    }
+
+    // Relative mode (measured in Obsidian): always a path relative to the
+    // source file, `%20` for spaces. Same-folder links get an explicit `./`
+    // (a deliberate departure: bare names can become ambiguous later).
+    #[test]
+    fn markdown_relative_links_match_obsidian() {
+        use crate::server::LinkFormat;
+        let s = styled_server(LinkStyle::Markdown(LinkFormat::Relative), true);
+        let r = rel_vault();
+        let src = "rel/deep/x/src";
+        let f = |t: &str| s.format_link(&r, src, t, None);
+        assert_eq!(f("rel/deep/x/Sibling"), "[Sibling](./Sibling.md)");
+        assert_eq!(f("rel/deep/Parent"), "[Parent](../Parent.md)");
+        assert_eq!(f("rel/Top"), "[Top](../../Top.md)");
+        assert_eq!(f("rel/other/Uniq"), "[Uniq](../../other/Uniq.md)");
+        assert_eq!(f("RootNote"), "[RootNote](../../../RootNote.md)");
+        assert_eq!(f("rel/amb1/Dup"), "[Dup](../../amb1/Dup.md)");
+        assert_eq!(f("rel/amb2/Dup"), "[Dup](../../amb2/Dup.md)");
+        assert_eq!(f("rel/other/My Note"), "[My Note](../../other/My%20Note.md)");
+        // Custom display text keeps the full relative path.
+        assert_eq!(
+            s.format_link(&r, src, "rel/other/Uniq", Some("see this")),
+            "[see this](../../other/Uniq.md)",
+        );
+        // Every written link must read back as an edge to its own target.
+        for t in ["rel/deep/x/Sibling", "rel/deep/Parent", "rel/Top", "rel/other/Uniq",
+                  "rel/other/My Note", "RootNote", "rel/amb1/Dup", "rel/amb2/Dup"] {
+            let written = f(t);
+            let read = LibraryServer::extract_markdown_links(&written);
+            assert_eq!(read.len(), 1, "{}", written);
+            assert_eq!(r.resolve(src, &read[0]).as_deref(), Some(t), "{}", written);
+        }
+    }
+
+    #[test]
+    fn markdown_shortest_and_absolute_use_vault_paths() {
+        use crate::server::LinkFormat;
+        let r = rel_vault();
+        for fmt in [LinkFormat::Shortest, LinkFormat::Absolute] {
+            let s = styled_server(LinkStyle::Markdown(fmt), true);
+            assert_eq!(
+                s.format_link(&r, "rel/deep/x/src", "rel/other/Uniq", None),
+                "[Uniq](rel/other/Uniq.md)",
+            );
+        }
+    }
+
+    #[test]
+    fn wikilink_style_keeps_bare_names_unless_ambiguous() {
+        let s = styled_server(LinkStyle::Wikilink, true);
+        let r = rel_vault();
+        assert_eq!(s.format_link(&r, "RootNote", "rel/other/Uniq", None), "[[Uniq]]");
+        assert_eq!(s.format_link(&r, "RootNote", "rel/amb1/Dup", None), "[[rel/amb1/Dup]]");
+        assert_eq!(
+            s.format_link(&r, "RootNote", "rel/other/Uniq", Some("see this")),
+            "[[Uniq|see this]]",
+        );
+    }
+
+    #[test]
+    fn auto_link_writes_markdown_links_in_markdown_vaults() {
+        use crate::server::LinkFormat;
+        let s = styled_server(LinkStyle::Markdown(LinkFormat::Relative), true);
+        let titles = vec![(
+            "QuantFlow".to_string(),
+            "QuantFlow".to_string(),
+            "Index/QuantFlow.md".to_string(),
+        )];
+        let (out, added) = s.auto_link_content("See quantflow tuning.", "notes/a.md", &titles);
+        assert_eq!(out, "See [quantflow](../Index/QuantFlow.md) tuning.");
+        assert_eq!(added, vec!["QuantFlow"]);
+    }
+
+    // suggest_links / auto-link must not re-link a note the content already
+    // links to by markdown link, nor wrap text inside an existing link.
+    #[test]
+    fn auto_link_skips_notes_already_linked_by_markdown() {
+        use crate::server::LinkFormat;
+        let s = styled_server(LinkStyle::Markdown(LinkFormat::Relative), true);
+        let titles = vec![(
+            "QuantFlow".to_string(),
+            "QuantFlow".to_string(),
+            "Index/QuantFlow.md".to_string(),
+        )];
+        let already = "Read [the notes](../Index/QuantFlow.md). QuantFlow again.";
+        let (out, added) = s.auto_link_content(already, "notes/a.md", &titles);
+        assert_eq!((out.as_str(), added.len()), (already, 0));
+
+        let inside = "[all about QuantFlow](https://example.com/x)";
+        let (out, added) = s.auto_link_content(inside, "notes/a.md", &titles);
+        assert_eq!((out.as_str(), added.len()), (inside, 0));
+    }
+
+    // A mention that matches several same-named notes is linked only when
+    // exactly one of them sits in the writing note's own folder.
+    #[test]
+    fn auto_link_skips_ambiguous_names_unless_same_folder() {
+        use crate::server::LinkFormat;
+        let s = styled_server(LinkStyle::Markdown(LinkFormat::Relative), true);
+        let titles = vec![
+            ("room-unlocking".to_string(), "room-unlocking".to_string(), "features/room-unlocking.md".to_string()),
+            ("room-unlocking".to_string(), "room-unlocking".to_string(), "plans/room-unlocking.md".to_string()),
+            ("hand-entry-forms".to_string(), "hand-entry-forms".to_string(), "patterns/hand-entry-forms.md".to_string()),
+            ("hand-entry-forms".to_string(), "hand-entry-forms".to_string(), "plans/hand-entry-forms.md".to_string()),
+        ];
+        let text = "See room-unlocking and hand-entry-forms.";
+        let (out, added) = s.auto_link_content(text, "patterns/new.md", &titles);
+        assert_eq!(out, "See room-unlocking and [hand-entry-forms](./hand-entry-forms.md).");
+        assert_eq!(added, vec!["hand-entry-forms"]);
+        // Written from a folder with no same-named note: neither is linked.
+        let (out, added) = s.auto_link_content(text, "other/new.md", &titles);
+        assert_eq!((out.as_str(), added.len()), (text, 0));
+    }
+
+    #[test]
+    fn auto_link_can_be_disabled_for_writes_only() {
+        let s = styled_server(LinkStyle::Wikilink, false);
+        let titles = vec![(
+            "QuantFlow".to_string(),
+            "QuantFlow".to_string(),
+            "Index/QuantFlow.md".to_string(),
+        )];
+        let text = "See QuantFlow tuning.";
+        let (out, added) = s.maybe_auto_link(text, "notes/a.md", &titles);
+        assert_eq!((out.as_str(), added.len()), (text, 0));
+        // Suggestions still work with auto-linking off.
+        let (_, suggestions) = s.auto_link_content(text, "notes/a.md", &titles);
+        assert_eq!(suggestions, vec!["QuantFlow"]);
+    }
+
+    #[test]
+    fn link_style_is_read_from_obsidian_app_json() {
+        use crate::server::LinkFormat;
+        let none = temp_vault("style-none", &[("a.md", "x")]);
+        assert_eq!(LibraryServer::detect_link_style(&[none.clone()]), LinkStyle::Wikilink);
+
+        let rel = temp_vault("style-rel", &[(".obsidian/app.json", r#"{"useMarkdownLinks": true, "newLinkFormat": "relative"}"#)]);
+        assert_eq!(
+            LibraryServer::detect_link_style(&[rel.clone()]),
+            LinkStyle::Markdown(LinkFormat::Relative),
+        );
+
+        let short = temp_vault("style-short", &[(".obsidian/app.json", r#"{"useMarkdownLinks": true}"#)]);
+        assert_eq!(
+            LibraryServer::detect_link_style(&[short.clone()]),
+            LinkStyle::Markdown(LinkFormat::Shortest),
+        );
+
+        for d in [none, rel, short] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn masking_handles_non_ascii_and_crlf() {
+        let md = "héllo `[[Inline]]` ünï [[Real]]\n\n```\n[[Fenced]] 日本語\n```\n\nafter [x](after.md) 日本 <!-- [[Html]] --> end [[Last]]\n";
+        let expected = vec!["Real", "Last", "after.md"];
+        assert_eq!(LibraryServer::extract_links(md), expected);
+        assert_eq!(LibraryServer::extract_links(&md.replace('\n', "\r\n")), expected);
+        // Tab-indented code is code too.
+        assert_eq!(LibraryServer::extract_links("text\n\n\t[[Tabbed]]\n\n[[Kept]]\n"), vec!["Kept"]);
+    }
+
+    // Written links must read back as edges to the same note, including names
+    // with spaces, parentheses, colons, percent signs and non-ASCII letters.
+    #[test]
+    fn written_links_round_trip_for_awkward_names() {
+        use crate::server::LinkFormat;
+        let ids = ["My Note (v2)", "café", "dir with space/Note", "Meeting: Q3", "a/b/c d", "x%y", "deep/er/src"];
+        let r = resolver(&ids);
+        for fmt in [LinkFormat::Relative, LinkFormat::Shortest, LinkFormat::Absolute] {
+            let s = styled_server(LinkStyle::Markdown(fmt), true);
+            for t in &ids[..6] {
+                let written = s.format_link(&r, "deep/er/src", t, None);
+                let read = LibraryServer::extract_markdown_links(&written);
+                assert_eq!(read.len(), 1, "{:?}: {}", fmt, written);
+                assert_eq!(r.resolve("deep/er/src", &read[0]).as_deref(), Some(*t), "{:?}: {}", fmt, written);
+            }
+        }
+    }
+
+    #[test]
+    fn resolver_edge_cases() {
+        let r = resolver(&["a/Foo", "b/Foo", "c/sub/Foo", "Top"]);
+        assert_eq!(r.resolve("x/src", "/Top").as_deref(), Some("Top"));
+        assert_eq!(r.resolve("x/src", "/a/Foo").as_deref(), Some("a/Foo"));
+        assert_eq!(r.resolve("x/src", "/Nope"), None);
+        assert_eq!(r.resolve("x/src", ""), None);
+        assert_eq!(r.resolve("x/src", "Foo.MD").as_deref(), Some("a/Foo"));
+        assert!(r.escapes_vault("Top", "../x.md"));
+        assert!(!r.escapes_vault("a/Foo", "../Top.md"));
+        assert_eq!(r.ambiguous_matches("Foo"), vec!["a/Foo", "b/Foo", "c/sub/Foo"]);
+        assert!(r.ambiguous_matches("a/Foo").is_empty());
+        assert!(r.ambiguous_matches("sub/Foo").is_empty());
+        assert_eq!(
+            r.duplicate_names(),
+            vec![("Foo".to_string(), vec!["a/Foo".to_string(), "b/Foo".to_string(), "c/sub/Foo".to_string()])],
+        );
+    }
+
+    #[test]
+    fn ambiguity_note_names_the_note_that_was_used() {
+        let mut v = serde_json::json!({ "a": 1 });
+        note_ambiguity(&mut v, "path", "a/Foo", &["a/Foo".to_string(), "b/Foo".to_string()]);
+        assert_eq!(v["ambiguous"]["path"]["used"], "a/Foo");
+        assert_eq!(v["ambiguous"]["path"]["also_matches"], serde_json::json!(["b/Foo"]));
+        // Two ambiguous inputs (shortest_path's from/to) must both be reported.
+        note_ambiguity(&mut v, "to", "c/Bar", &["c/Bar".to_string(), "d/Bar".to_string()]);
+        assert_eq!(v["ambiguous"]["to"]["used"], "c/Bar");
+        assert_eq!(v["ambiguous"]["path"]["used"], "a/Foo");
+        let mut w = serde_json::json!({});
+        note_ambiguity(&mut w, "path", "x", &[]);
+        assert!(w.get("ambiguous").is_none());
+    }
+
+    // Deleted, renamed and edited files must all show up in the graph.
+    #[test]
+    fn refresh_follows_delete_rename_and_edit() {
+        let dir = temp_vault("refresh-all", &[
+            ("a.md", "[[b]] [c](sub/c.md)"),
+            ("b.md", "x"),
+            ("sub/c.md", "y"),
+        ]);
+        let server = server_for(dir.clone());
+        let mut cache = VaultCache::build_full(&server);
+        assert_eq!(cache.incoming["b"], vec!["a"]);
+
+        std::fs::remove_file(dir.join("b.md")).unwrap();
+        cache.check_and_refresh(&server);
+        assert_eq!(cache.outgoing["a"], vec!["?b", "sub/c"]);
+        assert!(!cache.outgoing.contains_key("b"));
+
+        std::fs::rename(dir.join("sub/c.md"), dir.join("sub/d.md")).unwrap();
+        cache.check_and_refresh(&server);
+        assert_eq!(cache.outgoing["a"], vec!["?b", "?sub/c"]);
+        assert!(cache.outgoing.contains_key("sub/d") && !cache.outgoing.contains_key("sub/c"));
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(dir.join("a.md"), "[x](sub/d.md)").unwrap();
+        cache.check_and_refresh(&server);
+        assert_eq!(cache.outgoing["a"], vec!["sub/d"]);
+        assert_eq!(cache.incoming["sub/d"], vec!["a"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Generated index notes follow the vault's link style and qualify
+    // same-named notes.
+    #[test]
+    fn index_notes_use_the_vault_link_style() {
+        use crate::server::LinkFormat;
+        let dir = temp_vault("index-style", &[
+            ("Index/Topic.md", "# Topic"),
+            ("a/Dup.md", "Topic material"),
+            ("b/Dup.md", "Topic material"),
+            ("c/Uniq.md", "Topic material"),
+        ]);
+        let mut server = server_for(dir.clone());
+        *server.cache.lock().unwrap() = VaultCache::build_full(&server);
+
+        let wiki = crate::index::generate_index_body(&server, "Topic", "").0;
+        assert!(wiki.contains("[[a/Dup]]") && wiki.contains("[[b/Dup]]") && wiki.contains("[[Uniq]]"), "{}", wiki);
+
+        server.link_style = LinkStyle::Markdown(LinkFormat::Relative);
+        let md = crate::index::generate_index_body(&server, "Topic", "").0;
+        assert!(md.contains("[Dup](../a/Dup.md)") && md.contains("[Dup](../b/Dup.md)"), "{}", md);
+        assert!(md.contains("[Uniq](../c/Uniq.md)") && !md.contains("[["), "{}", md);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Unresolved `?target` nodes are plain text in the report, not links.
+    #[test]
+    fn report_links_use_the_formatter_and_skip_unresolved() {
+        let gods = vec![crate::graph::GodNode {
+            name: "a".to_string(), score: 1.0, degree: 1, betweenness: 0.0, pagerank: 0.0,
+        }];
+        let communities = vec![vec!["a".to_string(), "?gone".to_string()]];
+        let community_of = HashMap::new();
+        let link = |id: &str| match id.strip_prefix('?') {
+            Some(missing) => missing.to_string(),
+            None => format!("<{}>", id),
+        };
+        let out = crate::report::generate_report("V", 2, 1, &communities, &gods, &[], 0, &community_of, &link);
+        assert!(out.contains("<a>") && out.contains("gone") && !out.contains("?gone") && !out.contains("[["), "{}", out);
+    }
+
+    fn temp_vault(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("librarian-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (rel, body) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        dir
+    }
+
+    fn server_for(dir: std::path::PathBuf) -> LibraryServer {
+        LibraryServer {
+            library_paths: vec![dir],
+            default_ignores: vec![],
+            link_stoplist: vec![],
+            isolated_folders: vec![],
+            auto_link: true,
+            link_style: LinkStyle::Wikilink,
+            cache: Arc::new(Mutex::new(VaultCache::default())),
+            tool_router: LibraryServer::new_tool_router(),
+        }
+    }
+
+    // Markdown links become graph edges; same-named notes in different folders
+    // stay distinct nodes; unresolved links are kept apart from real notes.
+    #[test]
+    fn markdown_links_build_graph_edges() {
+        let dir = temp_vault("mdgraph", &[
+            ("INDEX.md", "[arch](architecture.md) [orm](patterns/orm.md#rows) [d](plans/dup.md) [ext](https://x.dev/a.md) [img](pic.png) [gone](missing.md) [out](../README.md)"),
+            ("architecture.md", "no links"),
+            ("patterns/orm.md", "[back](../architecture.md) [d](dup.md)"),
+            ("patterns/dup.md", "x"),
+            ("plans/dup.md", "y"),
+        ]);
+        let server = server_for(dir.clone());
+        let cache = VaultCache::build_full(&server);
+
+        let mut index_out = cache.outgoing["INDEX"].clone();
+        index_out.sort();
+        assert_eq!(
+            index_out,
+            vec!["?missing", "architecture", "patterns/orm", "plans/dup"],
+        );
+        let mut orm_out = cache.outgoing["patterns/orm"].clone();
+        orm_out.sort();
+        assert_eq!(orm_out, vec!["architecture", "patterns/dup"]);
+        assert_eq!(cache.incoming["plans/dup"], vec!["INDEX"]);
+        assert_eq!(cache.incoming["patterns/dup"], vec!["patterns/orm"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Adding a file can change how an existing bare reference resolves, so the
+    // graph must be re-derived on refresh, not patched per file.
+    #[test]
+    fn refresh_reresolves_existing_links() {
+        let dir = temp_vault("reresolve", &[
+            ("src.md", "[[Foo]]"),
+            ("deep/er/Foo.md", "x"),
+        ]);
+        let server = server_for(dir.clone());
+        let mut cache = VaultCache::build_full(&server);
+        assert_eq!(cache.outgoing["src"], vec!["deep/er/Foo"]);
+
+        std::fs::write(dir.join("Foo.md"), "root").unwrap();
+        cache.check_and_refresh(&server);
+        assert_eq!(cache.outgoing["src"], vec!["Foo"]);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -4,7 +4,7 @@
 //! for the topic name, unioned with the topic's direct graph neighbors.
 
 use crate::server::LibraryServer;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 /// Extract the human description line from an existing MOC: the first prose
@@ -36,11 +36,14 @@ pub fn generate_index_body(server: &LibraryServer, topic: &str, description: &st
     {
         let cache = server.cache.lock().unwrap();
 
-        // stem -> first relative path, for resolving graph neighbors to files
-        let mut stem_to_rel: HashMap<String, String> = HashMap::new();
-        for (_match_term, canonical, rel) in &cache.titles {
-            stem_to_rel.entry(canonical.clone()).or_insert_with(|| rel.clone());
-        }
+        // Node ids of real notes, for resolving graph neighbors to files
+        // (dangling `?target` neighbors have no file).
+        let known: HashSet<String> = cache
+            .titles
+            .iter()
+            .map(|(_, _, rel)| crate::cache::id_from_rel(rel))
+            .collect();
+        let topic_id = format!("Index/{}", topic);
 
         // 1. Full-text search hits for the topic name — this is what pulls in
         //    notes that mention the topic but were never linked to it.
@@ -50,15 +53,15 @@ pub fn generate_index_body(server: &LibraryServer, topic: &str, description: &st
 
         // 2. Direct graph neighbors of the topic (both directions).
         let mut neighbor_stems: HashSet<String> = HashSet::new();
-        if let Some(outs) = cache.outgoing.get(topic) {
+        if let Some(outs) = cache.outgoing.get(&topic_id) {
             neighbor_stems.extend(outs.iter().cloned());
         }
-        if let Some(ins) = cache.incoming.get(topic) {
+        if let Some(ins) = cache.incoming.get(&topic_id) {
             neighbor_stems.extend(ins.iter().cloned());
         }
-        for stem in neighbor_stems {
-            if let Some(rel) = stem_to_rel.get(&stem) {
-                related.insert(rel.clone());
+        for id in neighbor_stems {
+            if known.contains(&id) {
+                related.insert(format!("{}.md", id));
             }
         }
     }
@@ -72,16 +75,23 @@ pub fn generate_index_body(server: &LibraryServer, topic: &str, description: &st
 
     // Group by parent directory.
     let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for rel in &related {
-        let p = PathBuf::from(rel);
-        let dir = p
-            .parent()
-            .map(|d| d.to_string_lossy().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "(root)".to_string());
-        if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
-            if !stem.is_empty() && stem != topic {
-                by_dir.entry(dir).or_default().push(stem);
+    {
+        let cache = server.cache.lock().unwrap();
+        for rel in &related {
+            let p = PathBuf::from(rel);
+            let dir = p
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "(root)".to_string());
+            let id = crate::cache::id_from_rel(rel);
+            if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                if !stem.is_empty() && stem != topic {
+                    by_dir
+                        .entry(dir)
+                        .or_default()
+                        .push(server.format_link(&cache.resolver, &format!("Index/{}", topic), &id, None));
+                }
             }
         }
     }
@@ -112,7 +122,7 @@ pub fn generate_index_body(server: &LibraryServer, topic: &str, description: &st
     for (dir, stems) in &by_dir {
         body.push_str(&format!("\n## {}\n\n", dir));
         for stem in stems {
-            body.push_str(&format!("- [[{}]]\n", stem));
+            body.push_str(&format!("- {}\n", stem));
         }
     }
 

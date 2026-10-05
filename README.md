@@ -108,9 +108,9 @@ Librarian exposes 17 tools to Claude:
 |------|-------------|
 | `library_search` | Full-text search across all vault files (trigram-indexed) |
 | `library_read` | Read a file by relative path |
-| `library_write` | Write a file with auto-wikilink detection |
+| `library_write` | Write a file with auto-linking in the vault's link style |
 | `library_list` | List files and directories (shows vault roots when multi-vault) |
-| `library_links` | Get backlinks and outgoing wikilinks for a file |
+| `library_links` | Get backlinks and outgoing links (wikilinks and markdown links) for a file |
 | `library_tags` | List all #tags with counts, optionally filtered by prefix |
 | `library_metadata` | Read YAML frontmatter from a file |
 | `library_daily` | Create or append to a daily note (Journal/YYYY/YYYY-MM-DD.md) |
@@ -163,15 +163,35 @@ The vault includes source evaluation (5-tier trust system), contradiction protoc
 
 ### Auto-linking
 
-When Claude writes files via `library_write`, Librarian scans for mentions of existing note titles and wraps them in `[[wikilinks]]`. This happens **only on explicit writes** — Librarian never modifies files you didn't ask it to write.
+When Claude writes files via `library_write`, Librarian scans for mentions of existing note titles and links them. This happens **only on explicit writes** — Librarian never modifies files you didn't ask it to write.
 
-Links use canonical file names so they resolve correctly in Obsidian's graph view, even on case-sensitive filesystems. Frontmatter aliases are supported: if a note has `aliases: [ML, machine learning]`, mentions will auto-link using `[[Note Name|ML]]` format.
+The link style follows the vault's own Obsidian settings, read from `.obsidian/app.json` of the first vault (`LIBRARIAN_LINK_STYLE=wikilink|markdown` overrides the wikilink/markdown choice):
 
-Auto-linking skips code blocks, inline code, URLs, and existing wikilinks to avoid corrupting content.
+| `useMarkdownLinks` | `newLinkFormat` | Written link |
+|---|---|---|
+| `false` (default) | any | `[[Note]]`, or `[[Note\|ML]]` for an alias; `[[folder/Note]]` if the name is ambiguous |
+| `true` | `relative` | `[Note](../folder/Note.md)`; same-folder links are `[Note](./Note.md)` |
+| `true` | `shortest` / `absolute` | `[Note](folder/Note.md)` (vault-root path) |
+
+Markdown links never rely on a bare file name, so a note added later can't make them ambiguous. A mention that matches several same-named notes is linked only if exactly one of them is in the writing note's own folder. Frontmatter aliases are supported.
+
+To turn auto-linking off, run with `--no-autolink` or set `LIBRARIAN_AUTOLINK=off`. `library_suggest_links` still reports suggestions, and it skips notes that are already linked by wikilink or markdown link.
+
+Auto-linking skips code blocks, inline code, URLs, and existing links to avoid corrupting content.
+
+### Link resolution
+
+Notes are graph nodes identified by their vault-relative path (`plans/room-unlocking`), so same-named notes in different folders are distinct. Both `[[wikilinks]]` and relative markdown links (`[text](path.md#anchor)`, `./`, `../`, percent-encoded paths) are graph edges. A reference resolves the way Obsidian resolves it:
+
+1. an exact path from the vault root;
+2. a path relative to the linking file;
+3. a name or path-suffix match anywhere in the vault: the shortest full path wins, then byte-wise lexicographic order.
+
+Links inside fenced code, indented code, inline code and HTML comments are ignored, as are `http(s)`/`mailto:` URLs, non-`.md` targets, and links that leave the vault. Unresolved links appear as `?target` nodes. Tools that take a note (`library_links`, `library_traverse`, `library_shortest_path`) accept a path or a bare name, and `library_stats` lists `duplicate_names`.
 
 ### Knowledge graph traversal
 
-Librarian builds a bidirectional graph from your vault's `[[wikilinks]]` and exposes three graph tools:
+Librarian builds a bidirectional graph from your vault's `[[wikilinks]]` and relative markdown links and exposes three graph tools:
 
 - **Traverse** — BFS from any note, N hops deep. "Show me everything connected to this topic."
 - **Shortest path** — Find the link chain between two notes. "How are these ideas connected?"
@@ -199,10 +219,10 @@ private/
 
 Librarian works seamlessly alongside Obsidian — both can be open at the same time:
 
-- Reads and writes standard `[[wikilinks]]` and `[[note|display text]]`
+- Reads `[[wikilinks]]`, `[[note|display text]]` and relative markdown links; writes in whichever style the vault is configured for
 - Respects YAML frontmatter and `aliases`
 - Skips `.obsidian/` and `.trash/` directories
-- Auto-linked wikilinks resolve in Obsidian's graph view
+- Auto-linked links resolve in Obsidian's graph view
 - Daily notes follow `Journal/YYYY/YYYY-MM-DD.md` convention
 
 ## License

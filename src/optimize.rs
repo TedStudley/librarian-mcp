@@ -97,7 +97,7 @@ fn snapshot(
             c.search_index
                 .search(q, 20)
                 .iter()
-                .filter_map(|(p, _, _)| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                .map(|(p, _, _)| server.node_id(p))
                 .collect()
         };
         if hits.len() < 2 {
@@ -207,17 +207,16 @@ pub fn optimize(
         let c = server.cache.lock().unwrap();
         let mut stems = HashSet::new();
         let mut s2r = HashMap::new();
-        for (_m, canonical, rel) in &c.titles {
-            stems.insert(canonical.clone());
-            s2r.entry(canonical.clone()).or_insert_with(|| rel.clone());
+        for (_m, _canonical, rel) in &c.titles {
+            let id = crate::cache::id_from_rel(rel);
+            stems.insert(id.clone());
+            s2r.entry(id).or_insert_with(|| rel.clone());
         }
         let total = c.search_index.total_docs.max(1);
         let mut ts: HashMap<String, HashSet<String>> = HashMap::new();
         let mut idf: HashMap<String, f64> = HashMap::new();
         for (path, content) in &c.search_index.files {
-            let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
-                continue;
-            };
+            let stem = server.node_id(path);
             let mut terms = HashSet::new();
             for w in content.to_lowercase().split(|ch: char| !ch.is_alphanumeric()) {
                 // Distinctive content words only: skip short tokens and pure
@@ -250,7 +249,13 @@ pub fn optimize(
     let existing_hubs: HashSet<String> = stem_to_rel
         .iter()
         .filter(|(_, rel)| rel.starts_with("Index/"))
-        .map(|(stem, _)| stem.clone())
+        .map(|(id, _)| id.rsplit('/').next().unwrap_or(id).to_string())
+        .collect();
+    // Bare names of every note: a new hub must not reuse one, or `[[name]]`
+    // would become ambiguous.
+    let note_names: HashSet<String> = file_stems
+        .iter()
+        .map(|id| id.rsplit('/').next().unwrap_or(id).to_string())
         .collect();
 
     // Probe queries: community labels on the base graph (generic, graph-derived).
@@ -284,14 +289,15 @@ pub fn optimize(
                 // Name by distinctive terms; fall back to top node if none.
                 let mut label = community_topic_name(members, &term_sets, &idf);
                 if label.is_empty() {
-                    label = community_label(members, &adj);
+                    let top = community_label(members, &adj);
+                    label = top.rsplit('/').next().unwrap_or(&top).to_string();
                 }
                 if label.is_empty() {
                     continue;
                 }
-                // Never collide with an existing note stem or hub (would create
-                // a duplicate-stem note and break wikilink resolution).
-                if file_stems.contains(&label) || existing_hubs.contains(&label) {
+                // Never collide with an existing note name or hub (would create
+                // a duplicate-name note and make bare wikilinks ambiguous).
+                if note_names.contains(&label) || existing_hubs.contains(&label) {
                     label = format!("{} Map", label);
                 }
                 if created_hub_stems.contains(&label) {
@@ -305,8 +311,9 @@ pub fn optimize(
                 if linked.len() < min_community {
                     continue;
                 }
+                let hub_id = format!("Index/{}", label);
                 for m in &linked {
-                    add_edge(&mut out, &mut inc, &label, m);
+                    add_edge(&mut out, &mut inc, &hub_id, m);
                 }
                 created_hub_stems.insert(label.clone());
                 hubs.insert(label.clone(), linked.clone());
